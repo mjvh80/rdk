@@ -1,0 +1,4 @@
+#include <freerdp/codec/video.h>
+
+BOOL rdk_camera_conversion_supported(FREERDP_VIDEO_FORMAT source, FREERDP_VIDEO_FORMAT destination);
+#define freerdp_video_conversion_supported rdk_camera_conversion_supported
