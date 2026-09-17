@@ -1,5 +1,6 @@
 #include "rdk_capture.h"
 #include "rdk_keyboard.h"
+#include "rdk_latency.h"
 #include <stdio.h>
 
 typedef struct
@@ -82,6 +83,7 @@ static BOOL key(UINT vk, UINT16 scan, BOOL down, DWORD extraFlags)
 	KBDLLHOOKSTRUCT event = { 0 };
 	event.vkCode = vk;
 	event.scanCode = scan & 0xFF;
+	event.time = GetTickCount();
 	event.flags = extraFlags | (down ? 0 : LLKHF_UP) |
 	              ((scan & KBD_FLAGS_EXTENDED) ? LLKHF_EXTENDED : 0);
 	return rdk_capture_route(&capture, HC_ACTION,
@@ -233,12 +235,17 @@ int main(void)
 	BOOL (*tests[])(void) = { windows_run, only_foreground, focus_generation,
 		alt_tab_and_exit, injected_alt_codes, zero_scan_and_repeats, queue_failure,
 		inactive_hook_lifecycle };
-	for (size_t index = 0; index < ARRAYSIZE(tests); ++index)
+	for (UINT mode = 0; mode < 2; ++mode)
 	{
-		reset();
-		if (!tests[index]())
+		if (!rdk_latency_enable(mode != 0))
 			return 1;
+		for (size_t index = 0; index < ARRAYSIZE(tests); ++index)
+		{
+			reset();
+			if (!tests[index]())
+				return 1;
+		}
 	}
-	printf("Passed %zu keyboard capture tests\n", ARRAYSIZE(tests));
+	printf("Passed %zu keyboard capture tests with timing disabled and enabled\n", ARRAYSIZE(tests));
 	return 0;
 }

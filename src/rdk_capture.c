@@ -1,4 +1,5 @@
 #include "rdk_capture.h"
+#include "rdk_latency.h"
 
 static __declspec(thread) rdkCapture* g_capture;
 
@@ -48,6 +49,7 @@ BOOL rdk_capture_route(rdkCapture* capture, int code, WPARAM message, const KBDL
 		data |= (LPARAM)1 << 24;
 	if (message == WM_KEYUP || message == WM_SYSKEYUP)
 		data |= (LPARAM)1 << 31;
+	rdk_latency_message(RDK_LATENCY_HOOK, event->time);
 	if (!capture->post(capture->window, RDK_WM_KEY, MAKEWPARAM(event->vkCode, LOWORD(state)), data))
 	{
 		const DWORD error = GetLastError();

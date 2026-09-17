@@ -14,6 +14,7 @@
 #include "rdk_camera.h"
 #include "rdk_resources.h"
 #include "rdk_taskbar.h"
+#include "rdk_latency.h"
 
 #include <stdio.h>
 #include <dbt.h>
@@ -36,8 +37,10 @@ static void rdk_blit(rdkContext* rdk, HDC hdc)
 	rdpGdi* gdi = ((rdpContext*)rdk)->gdi;
 	if (!gdi || !gdi->primary_buffer)
 		return;
+	const UINT64 started = rdk_latency_begin();
 	(void)StretchDIBits(hdc, 0, 0, gdi->width, gdi->height, 0, 0, gdi->width, gdi->height,
 	                    gdi->primary_buffer, &rdk->bmi, DIB_RGB_COLORS, SRCCOPY);
+	rdk_latency_end(RDK_LATENCY_PAINT, started);
 }
 
 static void rdk_input_result(rdkContext* rdk, BOOL ok)
@@ -46,6 +49,7 @@ static void rdk_input_result(rdkContext* rdk, BOOL ok)
 	{
 		if (!rdk->inputFailed)
 			fprintf(stderr, "rdk: failed to send input; closing the session\n");
+		rdk->stopReason = "input forwarding failed";
 		rdk->inputFailed = TRUE;
 		rdk->quit = TRUE;
 	}
@@ -63,6 +67,8 @@ static void rdk_on_key(rdkContext* rdk, UINT msg, WPARAM wParam, LPARAM lParam)
 		rdk->reconnectRequested = TRUE;
 	}
 	rdk->quit = rdk->quit || rdk->keyboard.quit;
+	if (rdk->keyboard.quit && !rdk->inputFailed)
+		rdk->stopReason = rdk->keyboard.reconnect ? "reconnect shortcut requested" : "quit shortcut requested";
 	if (rdk->keyboard.minimize)
 	{
 		rdk->keyboard.minimize = FALSE;
@@ -210,6 +216,7 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 				printf("rdk: taskbar Reconnect selected; restarting the RDP connection\n");
 				fflush(stdout);
 				rdk->reconnectRequested = TRUE;
+				rdk->stopReason = "taskbar reconnect requested";
 				rdk->quit = TRUE;
 			}
 			return 0;
@@ -305,7 +312,10 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			return 0;
 		case WM_CLOSE:
 			if (rdk)
+			{
+				rdk->stopReason = "window close requested";
 				rdk->quit = TRUE;
+			}
 			return 0;
 		default:
 			return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -349,11 +359,67 @@ static BOOL rdk_desktop_resize(rdpContext* context)
  * binding that channel to the GDI framebuffer the primary buffer is never
  * filled and the window stays blank. gdi_graphics_pipeline_init() makes the
  * GFX decoder render into gdi->primary_buffer and drive the EndPaint path. */
+static const char* rdk_gfx_codec_name(UINT32 codec)
+{
+	switch (codec)
+	{
+		case RDPGFX_CODECID_AVC444v2: return "AVC444v2";
+		case RDPGFX_CODECID_AVC444: return "AVC444";
+		case RDPGFX_CODECID_AVC420: return "AVC420";
+		case RDPGFX_CODECID_UNCOMPRESSED: return "Uncompressed";
+		case RDPGFX_CODECID_CAVIDEO: return "RemoteFX";
+		case RDPGFX_CODECID_CLEARCODEC: return "ClearCodec";
+		case RDPGFX_CODECID_PLANAR: return "Planar";
+		case RDPGFX_CODECID_CAPROGRESSIVE: return "Progressive";
+		case RDPGFX_CODECID_CAPROGRESSIVE_V2: return "Progressive v2";
+		case RDPGFX_CODECID_ALPHA: return "Alpha";
+		default: return "Other";
+	}
+}
+
+static UINT rdk_gfx_surface_command(RdpgfxClientContext* gfx, const RDPGFX_SURFACE_COMMAND* command)
+{
+	if (!gfx || !gfx->custom || !command)
+		return ERROR_INVALID_DATA;
+	rdpGdi* gdi = (rdpGdi*)gfx->custom;
+	rdkContext* rdk = (rdkContext*)gdi->context;
+	if (!rdk || !rdk->origSurfaceCommand)
+		return ERROR_INVALID_DATA;
+	const UINT64 started = rdk_latency_begin();
+	const UINT status = rdk->origSurfaceCommand(gfx, command);
+	rdk_latency_end(RDK_LATENCY_DECODE, started);
+	const UINT32 mask = 1u << (command->codecId < 31 ? command->codecId : 31);
+	if (status == CHANNEL_RC_OK && !(rdk->gfxCodecsSeen & mask))
+	{
+		rdk->gfxCodecsSeen |= mask;
+		printf("rdk: graphics received: %s (codec=0x%04lX); decoded to GDI framebuffer\n",
+		    rdk_gfx_codec_name(command->codecId), (unsigned long)command->codecId);
+		fflush(stdout);
+	}
+	return status;
+}
+
 static void rdk_on_channel_connected(void* context, const ChannelConnectedEventArgs* e)
 {
 	rdpContext* ctx = (rdpContext*)context;
 	if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0)
-		(void)gdi_graphics_pipeline_init(ctx->gdi, (RdpgfxClientContext*)e->pInterface);
+	{
+		rdkContext* rdk = (rdkContext*)context;
+		RdpgfxClientContext* gfx = (RdpgfxClientContext*)e->pInterface;
+		if (!gdi_graphics_pipeline_init(ctx->gdi, gfx))
+		{
+			fprintf(stderr, "rdk: GDI graphics pipeline initialization failed\n");
+			rdk->stopReason = "GDI graphics pipeline initialization failed";
+			rdk->inputFailed = TRUE;
+			rdk->quit = TRUE;
+			return;
+		}
+		rdk->origSurfaceCommand = gfx->SurfaceCommand;
+		rdk->gfxCodecsSeen = 0;
+		gfx->SurfaceCommand = rdk_gfx_surface_command;
+		printf("rdk: GFX channel connected; waiting for server graphics updates\n");
+		fflush(stdout);
+	}
 	else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0 &&
 	         freerdp_settings_get_bool(ctx->settings, FreeRDP_RedirectClipboard))
 	{
@@ -368,7 +434,11 @@ static void rdk_on_channel_disconnected(void* context, const ChannelDisconnected
 {
 	rdpContext* ctx = (rdpContext*)context;
 	if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0)
+	{
 		gdi_graphics_pipeline_uninit(ctx->gdi, (RdpgfxClientContext*)e->pInterface);
+		((rdkContext*)context)->origSurfaceCommand = NULL;
+		((rdkContext*)context)->gfxCodecsSeen = 0;
+	}
 	else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
 	{
 		rdkContext* rdk = (rdkContext*)context;

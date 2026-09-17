@@ -2,6 +2,9 @@
 /build/
 /out/
 
+# Local crash reports and sensitive process memory
+/dumps/
+
 # vcpkg (manifest mode installs here)
 /vcpkg_installed/
 

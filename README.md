@@ -13,6 +13,11 @@ Build with the existing `default` CMake configure preset and `release` build
 preset (Visual Studio 2026, x64). The preset uses the existing vcpkg installation
 at `S:/vcpkg`. The executable is `build/Release/rdk.exe`.
 
+The repository's `vcpkg-configuration.json` selects a local FreeRDP 3.26.0
+overlay with an audio channel-mixing fix. Keep the overlay when configuring a
+clean build. Deploy the rebuilt `Release` directory with its matching DLLs,
+helper and licenses; replacing only `rdk.exe` does not update dependency fixes.
+
 ```powershell
 .\build\Release\rdk.exe /v:HOST
 .\build\Release\rdk.exe /v:HOST /text:"Test text" /startup-delay:5000 /char-delay:10
@@ -50,6 +55,50 @@ uses one rectangular window, its bounding area must not cover an unselected
 display. Invalid selections are rejected instead of silently including another
 display. Arrange the selected monitors next to each other in Windows if needed.
 Reconnect after changing the local display arrangement.
+
+## Graphics and AVC444
+
+H.264 decoding is available through FreeRDP's FFmpeg backend. GDI still presents
+the local framebuffer; this does not change keyboard handling or enable a new
+Direct3D renderer. AVC is opt-in while comparing quality and responsiveness:
+
+```powershell
+.\build\Release\rdk.exe /v:HOST /gfx:avc444
+```
+
+Add `/gfx:avc444` to your existing command to advertise AVC444 and AVC444v2.
+These preserve color detail better than AVC420, which can help small colored
+text and syntax highlighting. AVC444 is not necessarily lossless, and the server
+still decides which codecs to send. Unsupported servers can use non-AVC updates.
+For an AVC420 comparison, use `/gfx:avc420` instead.
+
+Remove all `/gfx` options to return to the previous non-AVC default, or explicitly
+use `/gfx:avc444:off,avc420:off` to disable AVC within the graphics pipeline.
+Other explicit `/gfx` options use FreeRDP's native behavior; bare `/gfx` uses its
+automatic codec selection. The selected settings survive rdk's Reconnect action.
+
+At connection time, `graphics requested:` lists the advertised settings. Once
+updates arrive, `graphics received: AVC444v2` (or `AVC444`, `AVC420`, `Planar`, etc.)
+identifies each GFX codec first decoded successfully during that channel's
+lifetime. A session can use more than one codec. A request or channel-open log
+alone does not prove AVC is active, and none of these logs proves the server is
+using a hardware encoder. Non-GFX legacy bitmap updates do not produce these
+codec messages.
+
+Compare identical monitor layouts, display scaling, editor themes, and workloads:
+small colored text, scrolling, window movement, and video. Check text clarity,
+responsiveness, CPU usage on both machines, and network throughput. Remote GPU
+rendering and hardware encoding depend on the host's Windows version, policies,
+GPU, and driver; rdk does not change those settings. Local FFmpeg decoding may
+use the CPU, and the GDI framebuffer remains in system memory.
+
+The manifest enables `freerdp[ffmpeg]`; configuring can take longer the first
+time while FFmpeg and FreeRDP are built. `/buildconfig` must report both
+`WITH_GFX_H264=ON` and `WITH_FFMPEG=ON`. When deploying, include the updated
+FreeRDP DLLs and their FFmpeg runtime dependencies from the build output, not
+just the new executable. The FFmpeg license notice is copied alongside the
+client as `FFmpeg-LICENSE.txt`; retain it and comply with the dependency's
+license/source-availability requirements when redistributing binaries.
 
 ## Credentials
 
@@ -132,6 +181,33 @@ window icons sized for display scaling. The device-change notice uses themed
 Windows controls, Segoe UI text, and a DPI-aware layout. Later remains the default
 action, and appearing notices do not take focus. The icon can be regenerated
 with `./tools/New-AppIcon.ps1`.
+
+## Sleep And Resume
+
+rdk registers Windows suspend/resume callbacks independently of its window's
+message loop. Sleep, or a resume notification after a missed suspend, signals
+FreeRDP's cancellation event so rdk stops using the interrupted connection.
+The callback does not send network traffic, stop drivers, or wait for cleanup.
+The normal session thread releases local input capture and tears down the old
+connection, without sending remote key releases over the interrupted transport.
+
+After cleanup and resume, rdk asks whether to reconnect. No is the default and
+exits the client; Yes creates a fresh connection with the existing in-memory
+credentials and settings. The remote session is not signed out. As with an
+explicit reconnect, `/input` replays and `/text` does not. A failed reconnect
+reports its error and exits; there is no automatic retry loop while the network
+is still recovering. A pending local quit takes precedence over recovery.
+
+The diagnostic report records the sleep/resume disconnect reason, teardown
+stages, `waiting-for-resume`, and `awaiting-resume-reconnect-choice`. Registration
+failure produces a warning. This does not forcibly terminate threads or guarantee
+that an unresponsive audio/video driver will return from cleanup. If the client
+still hangs, retain the last report lines and use Task Manager's **Create memory
+dump file** on the hung process before ending it. Keep that dump private.
+
+Tests simulate power notifications on a separate thread, exercise the actual
+FreeRDP abort event and context replacement, and register/unregister the Windows
+callback. They do not suspend the PC or exercise a live RDP server/device resume.
 
 ## Startup Input
 
@@ -341,16 +417,132 @@ Visual Studio C++ compiler and Windows SDK Media Foundation libraries. FreeRDP
 protocol sources retain their Apache-2.0 notices; the build places their license
 beside `rdk.exe` as `FreeRDP-camera-LICENSE.txt`. Ship that file with the client.
 
+## Microphone Channel-Mixing Fix
+
+The local FreeRDP overlay fixes a reproduced microphone crash in
+`waveInProc -> audin_receive_wave_data -> freerdp_dsp_ffmpeg_encode -> av_samples_copy`.
+When converting mono capture to stereo, FreeRDP 3.26.0 mixed the samples but passed
+the original mono format to FFmpeg. The encoder then copied a nonexistent second
+audio plane, causing a null-pointer read in the C runtime. The patch uses the
+mixed format for both frame creation and resampling; it also corrects the inverse
+stereo-to-mono case. No microphone, playback, camera or AVC feature is disabled.
+
+The fix is in the rebuilt `freerdp3.dll`, not just the client executable. Copy the
+matching rebuilt `Release` files to the machine running rdk. A synthetic AAC
+regression test reproduced the original access violation and passes with the
+patch; live microphone/server verification is still needed on that machine.
+
+## Exit Reasons And Crash Reports
+
+rdk prints `rdk: exiting: REASON (exit=N)` before cleanup, or `rdk: reconnecting:`
+for a requested reconnect. Reasons distinguish local quit/close requests, input
+or event-processing failures, connection failures, and server disconnects.
+FreeRDP errors and server disconnect reasons include numeric codes, symbolic
+names, and descriptions. If neither supplies a reason, the report says so;
+this alone cannot identify a network outage or remote crash.
+
+Each invocation also writes a small UTF-8 report under
+`%LOCALAPPDATA%\rdk\diagnostics`. The console prints its exact path. The report
+records UTC lifecycle stages, exit reasons/codes, the executable path/build time,
+and, on a caught fatal native exception, its type, address, thread and module
+offset, plus up to 32 stack frames from the faulting context. Frames contain code
+addresses and module offsets, not arguments or local variables; no PDB files or
+symbol downloads are needed to capture them. An unreadable stack stops the walk
+without discarding the initial exception report. Preserve the matching binaries
+to resolve offsets to functions later. It is not a copy of all console/FreeRDP output. It excludes command-line
+arguments, credentials, keystrokes and clipboard contents. File paths can reveal
+local account names; review the report before sharing it. Files are retained
+until manually deleted. Failure to open a report prints a warning and leaves
+console reporting available.
+
+Add `/crash-dump` to the usual command to also attempt a `.dmp` minidump beside
+the report on a fatal exception. Dumps are **off by default**: even a small dump
+can contain credentials, typed text, clipboard data or remote-session content.
+Keep dumps private; do not upload them indiscriminately. Release builds include
+`rdk.pdb`; preserve the matching executable, DLLs and symbols from the failing
+build for debugging. Start by sharing the text exit reason/error lines instead.
+
+Fatal exceptions terminate the process; rdk does not continue with potentially
+corrupted state. In-process reporting is best-effort, including on worker
+threads. Fail-fast/CRT aborts, severe stack or heap corruption, forced process
+termination, and failures before entry (such as missing DLLs) can bypass it or
+prevent dump writing. A report ending without an exit/fatal record only shows
+the last known stage, not the cause. Windows Error Reporting or Event Viewer's
+Application Error/Windows Error Reporting entries are the next source of
+evidence in that case. No Windows logging policy or registry settings are changed.
+
+## Diagnosing Input Lag
+
+Add `/latency` to your existing command and reproduce the lag for 20-30 seconds
+with ordinary typing and Alt+Tab. Keep the same codec and monitor settings during
+the measurement. The diagnostics are off by default and do not change input
+ordering, Alt-code composition, or the rendering backend.
+
+Every five seconds, stdout receives a `rdk: latency` summary with `n` (sample
+count), `avg`/`max` durations in milliseconds, and `slow` (samples at least 50 ms).
+Only aggregate timings/counts are retained; no key values, typed text, clipboard
+contents, or credentials are included in these summary lines. Reports reset the
+counters, and reconnect starts a fresh measurement. A stalled main loop cannot
+print until it resumes, so a longer `interval` is significant, though the first
+interval also includes connection setup.
+
+| Field | Measures | What a high value suggests |
+| --- | --- | --- |
+| `hook` | Windows keyboard event timestamp to rdk's hook | Input hook scheduling or another upstream hook |
+| `queue` | Posted keyboard message timestamp to main-loop dequeue | rdk's main loop is not servicing input promptly |
+| `send` | FreeRDP keyboard-send call duration | Contention or blocking inside the client/transport send path |
+| `events` | FreeRDP event processing | Network/protocol/channel work is keeping the loop busy |
+| `decode` | GFX surface-command processing, including decode/conversion | Expensive graphics work; legacy non-GFX updates are not measured here |
+| `paint` | GDI framebuffer blit | Slow local presentation |
+| `devices` | Microphone polling and camera inventory/notice handling | Device queries or notification work |
+
+Hook/queue timestamps have Windows millisecond-timer granularity (often around
+10-16 ms); tiny differences are not meaningful. Other durations use the performance
+counter. Timing areas can overlap and run on different threads: do not add the
+figures together or treat separate maxima as proof of a shared cause. Idle waits
+are not counted. `n=0` means no samples, not a measured zero latency. The Alt
+composer's intentional wait for more keys is not included in queue/send timings.
+
+Large queue spikes during the symptom identify a client-side delay, even if local
+applications remain responsive. Low hook/queue/send values during visible lag shift
+attention to delivery after the send call, the remote desktop/application, or the
+return display path; a fast send is not a remote acknowledgement. These are not
+end-to-end input latency, network RTT, or server CPU measurements.
+
+For a useful report, retain a few `rdk: latency` lines from both normal and laggy
+periods plus the `graphics received:` lines. Avoid per-key/TRACE logging while
+measuring. A blocked console or log destination can itself delay the main loop;
+the diagnostics write only one bounded summary per interval. A comparison with
+Microsoft's client against the same host, layout, and workload can further
+separate an rdk-specific problem from a shared remote/network problem.
+
 ## Verification
 
-With `BUILD_TESTING` enabled (the default), CTest registers `keyboard`, `startup`, `cli`,
-`credentials`, `capture`, `pointer`, `display`, `media`, `media_log`, `camera`, `camera_mf`,
+With `BUILD_TESTING` enabled (the default), CTest registers `power`, `audio_encode`, `crash`, `latency`, `keyboard`, `startup`, `cli`,
+`graphics`, `credentials`, `capture`, `pointer`, `display`, `media`, `media_log`, `camera`, `camera_mf`,
 `session`, `window`, `taskbar`, `clipboard_files`, `clipboard`, and `clipboard_native`.
+The audio encoder test uses synthetic silence at 44.1 kHz and the deployed
+FreeRDP/FFmpeg DLLs to verify mono/stereo AAC channel conversion and unchanged
+channel counts over multiple packets. It opens no microphone or network session.
 The keyboard executable uses an injected output recorder, not an RDP server.
+Crash tests launch disposable child processes with synthetic main/worker-thread
+exceptions, validate report content and the minidump exception stream, and check
+ordinary nonzero exits and unavailable report paths. CLI tests check persistent
+exit reasons and argument privacy. They do not crash a real client session.
+The latency tests use synthetic timings to verify aggregation, slow thresholds,
+five-second reporting, counter reset, timestamp wrap, concurrent updates, summary
+formatting, and disabled-mode silence. Capture tests run with timing both disabled
+and enabled. These tests do not record real keystrokes or reproduce live latency.
 It checks ANSI/OEM and hexadecimal composition, Unicode pairs, shortcut replay,
 AltGr, focus cleanup, repeats, special keys, early Alt release, bounded-buffer
 fallback, send failures, startup text, and 250 rapid sequences. The CLI suite
 checks missing values, invalid delays, and accepted numeric boundaries.
+The graphics suite checks the linked H.264/FFmpeg build, decoder initialization,
+AVC444/AVC420/native non-AVC options, unchanged non-AVC defaults, and graphics
+settings preservation when cloned for reconnect. Window tests verify that codec
+logging forwards commands and decoder failures without changing rendering.
+These checks do not establish live server negotiation, text quality, or hardware
+encoding; those require a connected comparison as described above.
 Startup tests record scan-code and Unicode events without sending real input.
 They check fixed-delay tokens, named key pairs, extended keys, escaped literals,
 UTF-16, held-key gating, and cleanup after send failure. Fake-clock scheduling

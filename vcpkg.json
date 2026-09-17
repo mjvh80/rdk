@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "description": "Reliable remote keyboard input over RDP via FreeRDP Unicode input events",
   "dependencies": [
-    "freerdp"
+    {
+      "name": "freerdp",
+      "features": ["ffmpeg"]
+    }
   ]
 }

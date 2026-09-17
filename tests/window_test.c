@@ -17,6 +17,50 @@ static BOOL record_scan(rdpInput* input, UINT16 flags, UINT8 code)
 	return TRUE;
 }
 
+static UINT surfaceCalls;
+static UINT surfaceResult;
+static const RDPGFX_SURFACE_COMMAND* lastSurfaceCommand;
+
+static UINT record_surface(RdpgfxClientContext* gfx, const RDPGFX_SURFACE_COMMAND* command)
+{
+	(void)gfx;
+	++surfaceCalls;
+	lastSurfaceCommand = command;
+	return surfaceResult;
+}
+
+static int check_graphics_logging(void)
+{
+	rdkContext rdk = { 0 };
+	rdpGdi gdi = { 0 };
+	RdpgfxClientContext gfx = { 0 };
+	gdi.context = (rdpContext*)&rdk;
+	gfx.custom = &gdi;
+	rdk.origSurfaceCommand = record_surface;
+	const UINT32 codecs[] = { RDPGFX_CODECID_AVC444v2, RDPGFX_CODECID_AVC444,
+	    RDPGFX_CODECID_AVC420, RDPGFX_CODECID_PLANAR };
+	for (size_t index = 0; index < ARRAYSIZE(codecs); ++index)
+	{
+		RDPGFX_SURFACE_COMMAND command = { 0 };
+		command.codecId = codecs[index];
+		const UINT32 previous = rdk.gfxCodecsSeen;
+		surfaceResult = ERROR_INVALID_DATA;
+		CHECK(rdk_gfx_surface_command(&gfx, &command) == ERROR_INVALID_DATA);
+		CHECK(rdk.gfxCodecsSeen == previous);
+		surfaceResult = CHANNEL_RC_OK;
+		CHECK(rdk_gfx_surface_command(&gfx, &command) == CHANNEL_RC_OK);
+		CHECK(rdk.gfxCodecsSeen == (previous | (1u << command.codecId)));
+		CHECK(rdk_gfx_surface_command(&gfx, &command) == CHANNEL_RC_OK);
+		CHECK(rdk.gfxCodecsSeen == (previous | (1u << command.codecId)));
+		CHECK(lastSurfaceCommand == &command && surfaceCalls == (index + 1) * 3);
+	}
+	CHECK(!rdk.quit && !rdk.inputFailed);
+	CHECK(strcmp(rdk_gfx_codec_name(RDPGFX_CODECID_AVC444v2), "AVC444v2") == 0);
+	CHECK(strcmp(rdk_gfx_codec_name(RDPGFX_CODECID_AVC444), "AVC444") == 0);
+	CHECK(strcmp(rdk_gfx_codec_name(RDPGFX_CODECID_AVC420), "AVC420") == 0);
+	return 0;
+}
+
 static void pump_messages(void)
 {
 	MSG message;
@@ -56,6 +100,7 @@ static int run_taskbar_helper(const WCHAR* action, const WCHAR* executable, DWOR
 
 int main(void)
 {
+	CHECK(check_graphics_logging() == 0);
 	SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 	HWINSTA originalStation = GetProcessWindowStation();
 	HDESK originalDesktop = GetThreadDesktop(GetCurrentThreadId());
@@ -147,12 +192,15 @@ int main(void)
 	CHECK(!rdk.focused && !(rdk.capture.state & 1));
 	CHECK(run_taskbar_helper(L"/reconnect", executable, 0) == 0);
 	CHECK(IsIconic(rdk.hwnd) && rdk.quit && rdk.reconnectRequested && !rdk.inputFailed);
+	CHECK(rdk.stopReason && strcmp(rdk.stopReason, "taskbar reconnect requested") == 0);
 	CHECK(!rdk.focused && !(rdk.capture.state & 1));
 	CHECK(run_taskbar_helper(L"/reconnect", executable, 0) == 0);
 	CHECK(rdk.quit && rdk.reconnectRequested);
 	rdk.reconnectRequested = FALSE;
 	CHECK(run_taskbar_helper(L"/reconnect", executable, 0) == 0);
 	CHECK(rdk.quit && !rdk.reconnectRequested);
+	SendMessageW(rdk.hwnd, WM_CLOSE, 0, 0);
+	CHECK(rdk.stopReason && strcmp(rdk.stopReason, "window close requested") == 0);
 	DestroyWindow(rdk.hwnd);
 	CHECK(SetThreadDesktop(originalDesktop));
 	CHECK(SetProcessWindowStation(originalStation));

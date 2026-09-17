@@ -91,6 +91,7 @@ static LRESULT CALLBACK rdk_notice_proc(HWND window, UINT message, WPARAM wParam
 			printf("rdk: device-change notice: Reconnect selected; restarting the RDP connection\n");
 			fflush(stdout);
 			rdk->reconnectRequested = TRUE;
+			rdk->stopReason = "device-change reconnect requested";
 			rdk->quit = TRUE;
 		}
 		else if (LOWORD(wParam) == IDCANCEL)

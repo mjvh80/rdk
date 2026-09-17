@@ -13,6 +13,7 @@
 #include <freerdp/client.h>
 #include <freerdp/gdi/gdi.h>
 #include <freerdp/update.h>
+#include <freerdp/client/rdpgfx.h>
 
 #include "rdk_keyboard.h"
 #include "rdk_capture.h"
@@ -43,12 +44,15 @@ typedef struct
 	int winW, winH;    /* window size */
 
 	pEndPaint origEndPaint; /* chained GDI end-paint callback */
+	pcRdpgfxSurfaceCommand origSurfaceCommand;
+	UINT32 gfxCodecsSeen;
 
 	rdkKeyboard keyboard;
 	rdkCapture capture;
 	BOOL focused;
 	BOOL desktopReady;
 	BOOL inputFailed;
+	const char* stopReason;
 	UINT16 mouseButtons;
 	BOOL quit; /* set from the window thread when the user asks to exit */
 } rdkContext;

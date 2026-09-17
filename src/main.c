@@ -26,6 +26,10 @@
 
 #include "rdk_client.h"
 #include "rdk_credentials.h"
+#include "rdk_graphics.h"
+#include "rdk_latency.h"
+#include "rdk_crash.h"
+#include "rdk_power.h"
 #include "rdk_camera.h"
 #include "rdk_session.h"
 #include "rdk_startup.h"
@@ -33,6 +37,7 @@
 
 #include <freerdp/client/cmdline.h>
 #include <freerdp/scancode.h>
+#include <freerdp/error.h>
 
 #define RDK_MAX_HANDLES (MAXIMUM_WAIT_OBJECTS - 1)
 
@@ -44,6 +49,7 @@ static DWORD g_startupDelayMs = 3000;
 static DWORD g_charDelayMs = 0;
 static BOOL g_promptCredentials = FALSE;
 static BOOL g_cameraEnabled = FALSE;
+static BOOL g_latency = FALSE;
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -111,6 +117,7 @@ static BOOL rdk_pre_connect(freerdp* instance)
 	if (g_cameraEnabled && !rdk_camera_register())
 		return FALSE;
 	rdpSettings* settings = instance->context->settings;
+	rdk_graphics_log_settings(settings);
 	if (!rdk_keyboard_configure(settings))
 		return FALSE;
 	return rdk_configure_display(settings, &((rdkContext*)instance->context)->displayBounds);
@@ -191,7 +198,7 @@ static BOOL rdk_startup_ready(rdkContext* rdk)
 	       freerdp_is_active_state((rdpContext*)rdk) && rdk_startup_keys_released();
 }
 
-static int rdk_run(rdkContext* rdk)
+static int rdk_run(rdkContext* rdk, rdkPower* power)
 {
 	rdpContext* context = (rdpContext*)rdk;
 	rdkStartup startup;
@@ -203,11 +210,12 @@ static int rdk_run(rdkContext* rdk)
 		fflush(stdout);
 	}
 
-	while (!freerdp_shall_disconnect_context(context) && !rdk->quit)
+	while (!rdk_power_interrupted(power) && !freerdp_shall_disconnect_context(context) && !rdk->quit)
 	{
 		const DWORD captureError = rdk_capture_error(&rdk->capture);
 		if (captureError)
 		{
+			rdk->stopReason = "keyboard capture failed";
 			fprintf(stderr, "rdk: keyboard capture failed (%lu)\n", captureError);
 			return 1;
 		}
@@ -220,6 +228,7 @@ static int rdk_run(rdkContext* rdk)
 		const DWORD nCount = freerdp_get_event_handles(context, handles, RDK_MAX_HANDLES);
 		if (nCount == 0)
 		{
+			rdk->stopReason = "FreeRDP returned no event handles";
 			fprintf(stderr, "rdk: failed to get event handles\n");
 			return 1;
 		}
@@ -228,9 +237,15 @@ static int rdk_run(rdkContext* rdk)
 		const DWORD timeout = rdk_startup_wait(&startup, GetTickCount64(), pending && rdk_startup_ready(rdk));
 		const DWORD status =
 		    MsgWaitForMultipleObjectsEx(nCount, handles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+		if (rdk_power_interrupted(power))
+			break;
 		if (status == WAIT_FAILED)
 		{
-			fprintf(stderr, "rdk: MsgWaitForMultipleObjectsEx failed\n");
+			rdk->stopReason = "Windows event wait failed";
+			char error[128];
+			snprintf(error, sizeof(error), "rdk: MsgWaitForMultipleObjectsEx failed (Windows error=%lu)", GetLastError());
+			fprintf(stderr, "%s\n", error);
+			rdk_crash_message(error);
 			return 1;
 		}
 
@@ -238,8 +253,11 @@ static int rdk_run(rdkContext* rdk)
 		UINT processed = 0;
 		while (processed++ < 64 && PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
 		{
+			if (msg.message == RDK_WM_KEY)
+				rdk_latency_message(RDK_LATENCY_QUEUE, msg.time);
 			if (msg.message == WM_QUIT)
 			{
+				rdk->stopReason = "Windows quit message received";
 				rdk->quit = TRUE;
 				break;
 			}
@@ -248,8 +266,9 @@ static int rdk_run(rdkContext* rdk)
 			if (rdk->quit)
 				break;
 		}
-		if (rdk->quit)
+		if (rdk->quit || rdk_power_interrupted(power))
 			break;
+		const UINT64 devicesStarted = rdk_latency_begin();
 		if (rdk_media_watch_changed(rdk->mediaWatch, GetTickCount64()))
 			rdk_media_notice(rdk);
 		if (rdk->cameraWatching && rdk->cameraCheckAt && GetTickCount64() >= rdk->cameraCheckAt)
@@ -279,10 +298,20 @@ static int rdk_run(rdkContext* rdk)
 				fprintf(stderr, "rdk: camera change detected but inventory could not be queried\n");
 			rdk->cameraCheckAt = 0;
 		}
+		rdk_latency_end(RDK_LATENCY_DEVICES, devicesStarted);
+		if (rdk_power_interrupted(power))
+			break;
 
-		if (!freerdp_check_event_handles(context))
+		const UINT64 eventsStarted = rdk_latency_begin();
+		const BOOL eventsOk = freerdp_check_event_handles(context);
+		rdk_latency_end(RDK_LATENCY_NETWORK, eventsStarted);
+		if (rdk_power_interrupted(power))
+			break;
+		if (!eventsOk)
 		{
 			const UINT32 err = freerdp_get_last_error(context);
+			rdk->stopReason = err == FREERDP_ERROR_SUCCESS ?
+			    "FreeRDP event processing ended the session" : "FreeRDP event processing failed";
 			if (err != FREERDP_ERROR_SUCCESS)
 				fprintf(stderr, "rdk: event handling failed: %s\n",
 				        freerdp_get_last_error_name(err));
@@ -294,6 +323,7 @@ static int rdk_run(rdkContext* rdk)
 			const BOOL wasStarted = startup.started;
 			if (!rdk_startup_step(&startup, &rdk->keyboard, GetTickCount64(), rdk_startup_ready(rdk)))
 			{
+				rdk->stopReason = "startup input could not be sent";
 				fprintf(stderr, "rdk: failed to send startup input (invalid UTF-16, unsupported Unicode input, or connection failure)\n");
 				return 1;
 			}
@@ -308,11 +338,45 @@ static int rdk_run(rdkContext* rdk)
 				fflush(stdout);
 			}
 		}
+		if (g_latency)
+			rdk_latency_report(GetTickCount64(), FALSE);
 	}
-	return rdk->inputFailed ? 1 : 0;
+	if (!rdk->stopReason)
+		rdk->stopReason = rdk->reconnectRequested ? "reconnect requested" :
+		    rdk->quit ? "local shutdown requested" : "FreeRDP requested disconnect";
+	return rdk->inputFailed || (!rdk->quit && freerdp_get_last_error(context) != FREERDP_ERROR_SUCCESS) ? 1 : 0;
 }
 
 /* ---- entry point -------------------------------------------------------- */
+
+static void rdk_report_exit(const char* action, const char* reason, int result, const rdpContext* context)
+{
+	char message[2048];
+	snprintf(message, sizeof(message), "rdk: %s: %s (exit=%d)", action, reason, result);
+	fprintf(result ? stderr : stdout, "%s\n", message);
+	rdk_crash_message(message);
+	if (context)
+	{
+		const UINT32 clientError = freerdp_get_last_error(context);
+		const UINT32 serverError = context->instance ? freerdp_error_info(context->instance) : 0;
+		snprintf(message, sizeof(message), "rdk: FreeRDP error=0x%08lX %s: %s; server disconnect=0x%08lX %s: %s",
+		    (unsigned long)clientError, clientError ? freerdp_get_last_error_name(clientError) : "none",
+		    clientError ? freerdp_get_last_error_string(clientError) : "no client error reported",
+		    (unsigned long)serverError, serverError ? freerdp_get_error_info_name(serverError) : "none",
+		    serverError ? freerdp_get_error_info_string(serverError) : "no server reason reported");
+		fprintf(result ? stderr : stdout, "%s\n", message);
+		rdk_crash_message(message);
+		const DWORD captureError = rdk_capture_error(&((rdkContext*)context)->capture);
+		if (captureError)
+		{
+			snprintf(message, sizeof(message), "rdk: keyboard capture Windows error=%lu", captureError);
+			fprintf(stderr, "%s\n", message);
+			rdk_crash_message(message);
+		}
+	}
+	fflush(stdout);
+	fflush(stderr);
+}
 
 static void rdk_usage(void)
 {
@@ -333,6 +397,11 @@ static void rdk_usage(void)
 	       "  /screen:1,2           use these Windows display numbers (first is remote primary)\n"
 	       "  /monitors:1,2         alias for /screen, using the same Windows numbers\n"
 	       "  /list:monitor         list active Windows display numbers and exit\n"
+	       "  /gfx:avc444           opt in to H.264 AVC444 for text/color detail (GDI display)\n"
+	       "  /gfx:avc420           opt in to H.264 AVC420 for comparison\n"
+	       "  (no /gfx option)      keep previous non-AVC graphics behavior\n"
+	       "  /latency              log timing summaries every 5s (no key values/text)\n"
+	       "  /crash-dump           also write a minidump on fatal exceptions (sensitive memory)\n"
 	       "  /microphone           redirect microphone; notify on default-device changes\n"
 	       "  /list:microphone      show local input devices, default, mute and format queries\n"
 	       "  /sound                play remote audio locally\n"
@@ -346,33 +415,39 @@ static void rdk_usage(void)
 	       "Minimize with Ctrl+Shift+F10; reconnect with Ctrl+Shift+F11; quit with Ctrl+Shift+F12.\n");
 }
 
-int wmain(int argc, wchar_t** argv)
+static int rdk_main(int argc, wchar_t** argv)
 {
 	SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-	if (argc == 2 && _wcsicmp(argv[1], L"/taskbar:minimize") == 0)
-		return rdk_taskbar_minimize() < 0 ? 1 : 0;
 
 	if (argc <= 1)
 	{
 		rdk_usage();
+		rdk_report_exit("exiting", "help displayed; no connection requested", 0, NULL);
 		return 0;
 	}
 
 	/* Split our own options out; everything else is forwarded to FreeRDP. */
 	char** fargv = (char**)calloc((size_t)argc + 1, sizeof(char*));
 	if (!fargv)
+	{
+		rdk_report_exit("exiting", "out of memory allocating command-line storage", 1, NULL);
 		return 1;
+	}
 
 	int fargc = 0;
 	int rc = 1;
+	const char* exitReason = "command-line allocation or UTF-8 conversion failed";
+	BOOL exitReported = FALSE;
 	BOOL listCameras = FALSE;
 	BOOL listMicrophones = FALSE;
 	BOOL startupDelaySet = FALSE;
 	BOOL showRdkHelp = FALSE;
 	rdpContext* context = NULL;
 	rdpSettings* reconnectSettings = NULL;
+	rdkPower* power = NULL;
 	rdkCredentials credentials;
 	rdk_credentials_init(&credentials);
+	rdk_crash_stage("parsing-command-line");
 	fargv[fargc++] = wide_to_utf8(argv[0] ? argv[0] : L"rdk");
 	if (!fargv[0])
 		goto cleanup;
@@ -381,6 +456,17 @@ int wmain(int argc, wchar_t** argv)
 	{
 		if (_wcsicmp(argv[i], L"/help") == 0 || wcscmp(argv[i], L"--help") == 0 || wcscmp(argv[i], L"/?") == 0)
 			showRdkHelp = TRUE;
+		if (_wcsicmp(argv[i], L"/latency") == 0)
+		{
+			g_latency = TRUE;
+			continue;
+		}
+		if (_wcsicmp(argv[i], L"/crash-dump") == 0)
+		{
+			rdk_crash_enable_dump();
+			fprintf(stderr, "rdk: crash dumps enabled; dumps may contain credentials and remote-session data; keep them private\n");
+			continue;
+		}
 		if (_wcsicmp(argv[i], L"/camera") == 0)
 		{
 			g_cameraEnabled = TRUE;
@@ -417,6 +503,8 @@ int wmain(int argc, wchar_t** argv)
 			                     startupOption ? startupValue : charValue;
 			if (!value && (argv[i][0] == L'/' || i + 1 >= argc))
 			{
+				exitReason = textOption ? "/text requires a value" : inputOption ? "/input requires a value" :
+				    startupOption ? "/startup-delay requires a value" : "/char-delay requires a value";
 				fprintf(stderr, "rdk: %ls requires a value; use %ls:VALUE\n", option, option);
 				goto cleanup;
 			}
@@ -426,6 +514,7 @@ int wmain(int argc, wchar_t** argv)
 			{
 				if (g_autoText && g_autoTokens != inputOption)
 				{
+					exitReason = "/input and /text cannot be combined";
 					fprintf(stderr, "rdk: /input and /text cannot be combined\n");
 					goto cleanup;
 				}
@@ -436,6 +525,8 @@ int wmain(int argc, wchar_t** argv)
 			{
 				if (!rdk_parse_delay(value, startupOption ? &g_startupDelayMs : &g_charDelayMs))
 				{
+					exitReason = startupOption ? "/startup-delay must be an integer from 0 to 4294967295" :
+					    "/char-delay must be an integer from 0 to 4294967295";
 					fprintf(stderr, "rdk: %ls requires an integer from 0 to 4294967295\n", option);
 					goto cleanup;
 				}
@@ -466,6 +557,7 @@ int wmain(int argc, wchar_t** argv)
 		size_t errorOffset = 0;
 		if (!rdk_startup_validate(g_autoText, &errorOffset))
 		{
+			exitReason = "invalid /input token sequence";
 			fprintf(stderr, "rdk: invalid /input at UTF-16 offset %zu; use <delay>, named keys, or << for a literal '<'\n", errorOffset);
 			goto cleanup;
 		}
@@ -474,9 +566,11 @@ int wmain(int argc, wchar_t** argv)
 	}
 	if (listCameras || listMicrophones)
 	{
+		rdk_crash_stage("listing-local-devices");
 		rc = 0;
 		if (listMicrophones && !rdk_microphone_list()) rc = 1;
 		if (listCameras && !rdk_camera_list()) rc = 1;
+		exitReason = rc ? "local device listing failed" : "local device listing completed";
 		goto cleanup;
 	}
 	RDP_CLIENT_ENTRY_POINTS entry = { 0 };
@@ -488,6 +582,8 @@ int wmain(int argc, wchar_t** argv)
 	entry.ClientNew = rdk_client_new;
 	entry.ClientFree = rdk_client_free;
 
+	exitReason = "FreeRDP context creation failed";
+	rdk_crash_stage("creating-context");
 	context = freerdp_client_context_new(&entry);
 	if (!context)
 	{
@@ -496,8 +592,9 @@ int wmain(int argc, wchar_t** argv)
 		goto cleanup;
 	}
 
-	const int status =
-	    freerdp_client_settings_parse_command_line(context->settings, fargc, fargv, FALSE);
+	exitReason = "FreeRDP command-line parsing failed";
+	rdk_crash_stage("parsing-freerdp-options");
+	const int status = rdk_graphics_parse(context->settings, fargc, fargv);
 	if (status != 0)
 	{
 		if (showRdkHelp)
@@ -505,25 +602,61 @@ int wmain(int argc, wchar_t** argv)
 		freerdp_client_settings_command_line_status_print(context->settings, status, fargc, fargv);
 		rc = (status <= COMMAND_LINE_STATUS_PRINT && status >= COMMAND_LINE_STATUS_PRINT_LAST) ? 0 : 1;
 		if (rc == 0 && freerdp_settings_get_bool(context->settings, FreeRDP_ListMonitors))
+		{
 			rc = rdk_list_monitors() ? 0 : 1;
+			exitReason = rc ? "monitor listing failed" : "monitor listing completed";
+		}
+		else if (rc == 0)
+			exitReason = "requested information displayed; no connection requested";
 		goto cleanup;
 	}
 
+	exitReason = "credential preparation failed or was cancelled";
+	rdk_crash_stage("preparing-credentials");
 	if (!rdk_credentials_prepare(&credentials, context->settings, g_promptCredentials))
 		goto cleanup;
 	if (g_cameraEnabled)
 	{
+		exitReason = "camera channel configuration failed";
 		const char* channel[] = { "rdpecam" };
 		if (!freerdp_client_add_dynamic_channel(context->settings, ARRAYSIZE(channel), channel))
 			goto cleanup;
 	}
 
+	exitReason = "could not preserve connection settings";
 	reconnectSettings = freerdp_settings_clone(context->settings);
 	if (!reconnectSettings)
 		goto cleanup;
+	power = rdk_power_new();
+	if (!power)
+	{
+		const char* message = "rdk: sleep/resume notifications unavailable; automatic sleep cancellation is disabled";
+		fprintf(stderr, "%s (Windows error=%lu)\n", message, GetLastError());
+		rdk_crash_message(message);
+	}
 	for (;;)
 	{
-		if (!freerdp_connect(context->instance))
+		if (power && !rdk_power_arm(power, freerdp_abort_event(context)))
+		{
+			exitReason = "could not arm sleep/resume connection cancellation";
+			rc = 1;
+			goto cleanup;
+		}
+		if (!rdk_latency_enable(g_latency))
+		{
+			exitReason = "latency timer initialization failed";
+			fprintf(stderr, "rdk: latency timer initialization failed\n");
+			goto cleanup;
+		}
+		if (g_latency)
+		{
+			printf("rdk: latency diagnostics enabled: 5s summaries; avg/max in ms, slow >= 50ms; no key values or text\n");
+			fflush(stdout);
+		}
+		exitReason = "RDP connection failed";
+		rdk_crash_stage("connecting");
+		const BOOL connected = freerdp_connect(context->instance);
+		if (!connected && !rdk_power_interrupted(power))
 		{
 			const UINT32 err = freerdp_get_last_error(context);
 			fprintf(stderr, "rdk: connection failed: %s\n", freerdp_get_last_error_name(err));
@@ -532,50 +665,119 @@ int wmain(int argc, wchar_t** argv)
 			rc = 1;
 			goto cleanup;
 		}
-		(void)rdk_credentials_save(&credentials);
-		printf("rdk: connected on %u monitor(s), %ux%u. Ctrl+Shift+F10 to minimize; Ctrl+Shift+F11 to reconnect; Ctrl+Shift+F12 to quit.\n",
-		       freerdp_settings_get_uint32(context->settings, FreeRDP_MonitorCount),
-		       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth),
-		       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight));
 		rdkContext* rdk = (rdkContext*)context;
-		rc = rdk_run(rdk);
+		if (connected)
+		{
+			(void)rdk_credentials_save(&credentials);
+			printf("rdk: connected on %u monitor(s), %ux%u. Ctrl+Shift+F10 to minimize; Ctrl+Shift+F11 to reconnect; Ctrl+Shift+F12 to quit.\n",
+			       freerdp_settings_get_uint32(context->settings, FreeRDP_MonitorCount),
+			       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth),
+			       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight));
+			rdk_crash_stage("connected-event-loop");
+			rc = rdk_run(rdk, power);
+		}
+		const BOOL powerInterrupted = rdk_power_interrupted(power);
+		const BOOL powerRecovery = powerInterrupted && !(rdk->quit && !rdk->inputFailed && !rdk->reconnectRequested);
+		if (powerInterrupted)
+		{
+			SetEvent(freerdp_abort_event(context));
+			if (powerRecovery)
+			{
+				rdk->stopReason = "PC sleep/resume interrupted the RDP connection";
+				rc = 0;
+			}
+			rdk->focused = FALSE;
+			rdk->mouseButtons = 0;
+			rdk_capture_set_active(&rdk->capture, FALSE);
+			if (rdk->hwnd && GetCapture() == rdk->hwnd)
+				ReleaseCapture();
+		}
+		exitReason = rdk->stopReason ? rdk->stopReason : "session loop ended without a specific reason";
+		rdk_report_exit(powerRecovery ? "disconnecting" : rdk->reconnectRequested && rc == 0 ? "reconnecting" : "exiting", exitReason, rc, context);
+		exitReported = TRUE;
+		if (g_latency)
+			rdk_latency_report(GetTickCount64(), TRUE);
 		if (!g_autoTokens)
 			g_autoText = NULL;
 		printf("rdk: shutdown: stopping keyboard capture\n");
 		fflush(stdout);
+		rdk_crash_stage("stopping-keyboard-capture");
 		rdk_capture_stop(&rdk->capture);
 		printf("rdk: shutdown: releasing remote keys\n");
 		fflush(stdout);
-		if (freerdp_is_active_state(context) && !rdk_keyboard_release_all(&rdk->keyboard))
+		rdk_crash_stage("releasing-remote-keys");
+		if (!powerInterrupted && freerdp_is_active_state(context) && !rdk_keyboard_release_all(&rdk->keyboard))
+		{
 			rc = 1;
-		const BOOL reconnect = rdk->reconnectRequested && rc == 0;
+			exitReason = "failed to release remote keys during shutdown";
+			exitReported = FALSE;
+		}
+		const BOOL reconnect = powerRecovery || (rdk->reconnectRequested && rc == 0);
 		printf("rdk: shutdown: disconnecting RDP\n");
 		fflush(stdout);
-		freerdp_disconnect(context->instance);
+		rdk_crash_stage("disconnecting");
+		if (connected)
+			freerdp_disconnect(context->instance);
 		printf("rdk: shutdown: RDP disconnected\n");
 		fflush(stdout);
 		if (!reconnect)
 			break;
 		printf("rdk: shutdown: freeing RDP context for reconnect\n");
 		fflush(stdout);
+		rdk_crash_stage("freeing-context-for-reconnect");
+		rdk_power_disarm(power);
 		freerdp_client_context_free(context);
+		context = NULL;
+		if (powerRecovery)
+		{
+			rdk_crash_stage("waiting-for-resume");
+			printf("rdk: old connection closed after sleep/resume; waiting to offer reconnect\n");
+			fflush(stdout);
+			if (!rdk_power_wait_resume(power))
+			{
+				exitReason = "waiting for PC resume failed";
+				rc = 1;
+				exitReported = FALSE;
+				goto cleanup;
+			}
+			rdk_crash_stage("awaiting-resume-reconnect-choice");
+			const int choice = MessageBoxW(NULL,
+			    L"The RDP connection was interrupted by PC sleep or resume.\n\nReconnect to the remote session?",
+			    L"rdk - Connection Interrupted", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+			if (choice != IDYES)
+			{
+				exitReason = choice ? "reconnect after sleep/resume declined" : "could not display resume reconnect prompt";
+				rc = choice ? 0 : 1;
+				exitReported = FALSE;
+				goto cleanup;
+			}
+			rdk_crash_message("rdk: reconnect after sleep/resume accepted");
+		}
 		printf("rdk: shutdown: RDP context freed; reconnecting\n");
 		fflush(stdout);
+		rdk_crash_stage("recreating-context");
 		context = rdk_session_recreate(&entry, reconnectSettings);
+		exitReported = FALSE;
 		if (!context)
 		{
+			exitReason = "could not recreate FreeRDP context for reconnect";
 			rc = 1;
 			goto cleanup;
 		}
 	}
 
 cleanup:
+	if (!exitReported)
+		rdk_report_exit("exiting", exitReason, rc, context);
+	rdk_power_free(power);
+	rdk_crash_stage("cleanup");
 	freerdp_settings_free(reconnectSettings);
 	rdk_credentials_clear(&credentials);
 	if (context)
 	{
 		printf("rdk: shutdown: freeing RDP context\n");
 		fflush(stdout);
+		rdk_crash_stage("freeing-context");
 		freerdp_client_context_free(context);
 		printf("rdk: shutdown: RDP context freed\n");
 		fflush(stdout);
@@ -584,4 +786,24 @@ cleanup:
 		free(fargv[i]);
 	free(fargv);
 	return rc;
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+	if (argc == 2 && _wcsicmp(argv[1], L"/taskbar:minimize") == 0)
+		return rdk_taskbar_minimize() < 0 ? 1 : 0;
+	if (!rdk_crash_init(NULL))
+		fprintf(stderr, "rdk: persistent diagnostic report unavailable; exit reasons will still be printed to the console\n");
+	__try
+	{
+		const int result = rdk_main(argc, argv);
+		rdk_crash_finish(result);
+		return result;
+	}
+	__except (rdk_crash_filter(GetExceptionInformation()))
+	{
+		const DWORD code = GetExceptionCode();
+		TerminateProcess(GetCurrentProcess(), code);
+		return 1;
+	}
 }

@@ -1,3 +1,39 @@
+foreach(option /crash-dump /CRASH-DUMP)
+    execute_process(COMMAND "${RDK_EXE}" "${option}" /help
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0 OR NOT output MATCHES "/crash-dump" OR
+       NOT output MATCHES "rdk: exiting: requested information displayed" OR
+       NOT error MATCHES "crash dumps enabled")
+        message(FATAL_ERROR "Crash diagnostic option ${option}: result=${result}, ${output}${error}")
+    endif()
+endforeach()
+
+execute_process(COMMAND "${RDK_EXE}" /p:rdk-test-secret-do-not-log "/input:<unknown>"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 1 OR NOT error MATCHES "rdk: exiting: invalid /input token sequence")
+    message(FATAL_ERROR "Missing specific exit reason: result=${result}, ${output}${error}")
+endif()
+string(REGEX MATCH "rdk: diagnostic report: ([^\r\n]+)" report_match "${output}")
+set(report_path "${CMAKE_MATCH_1}")
+if(NOT report_match OR NOT EXISTS "${report_path}")
+    message(FATAL_ERROR "Missing persistent diagnostic report: ${output}${error}")
+endif()
+file(READ "${report_path}" report)
+if(NOT report MATCHES "rdk: exiting: invalid /input token sequence" OR
+   NOT report MATCHES "exit_code=0x0000000000000001" OR
+   report MATCHES "rdk-test-secret|<unknown>|fatal native exception")
+    message(FATAL_ERROR "Persistent report is missing the exit reason or logs private arguments")
+endif()
+file(REMOVE "${report_path}")
+
+foreach(option /latency /LATENCY)
+    execute_process(COMMAND "${RDK_EXE}" "${option}" /help
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0 OR NOT output MATCHES "/latency" OR output MATCHES "rdk: latency interval=")
+        message(FATAL_ERROR "Latency help ${option}: result=${result}, ${output}${error}")
+    endif()
+endforeach()
+
 foreach(option --startup-delay --char-delay)
     foreach(value -1 4294967296 abc 12ms "")
         execute_process(COMMAND "${RDK_EXE}" "${option}" "${value}"
@@ -71,6 +107,18 @@ if(NOT result EQUAL 0)
     message(FATAL_ERROR "Literal --text compatibility: result=${result}, ${output}${error}")
 endif()
 message(STATUS "Passed CLI validation checks")
+foreach(option /gfx:avc444 /gfx:avc420 /gfx:avc444:off,avc420:off)
+    execute_process(COMMAND "${RDK_EXE}" "${option}" /help
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0 OR NOT output MATCHES "/gfx:avc444")
+        message(FATAL_ERROR "Graphics option ${option}: result=${result}, ${output}${error}")
+    endif()
+endforeach()
+execute_process(COMMAND "${RDK_EXE}" /buildconfig
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0 OR NOT output MATCHES "WITH_GFX_H264=ON" OR NOT output MATCHES "WITH_FFMPEG=ON")
+    message(FATAL_ERROR "AVC-enabled dependency build required: result=${result}, ${output}${error}")
+endif()
 execute_process(COMMAND "${RDK_EXE}" /camera /microphone /sound /help
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
 if(NOT result EQUAL 0)

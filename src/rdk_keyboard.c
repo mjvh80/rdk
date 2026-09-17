@@ -1,4 +1,5 @@
 #include "rdk_keyboard.h"
+#include "rdk_latency.h"
 #include <freerdp/freerdp.h>
 #include <freerdp/settings.h>
 #include <stdio.h>
@@ -25,7 +26,12 @@ static BOOL rdk_input_ready(rdpInput* input)
 
 static BOOL rdk_protocol_scan(rdpInput* input, UINT16 flags, UINT8 code)
 {
-	return rdk_input_ready(input) && freerdp_input_send_keyboard_event(input, flags, code);
+	if (!rdk_input_ready(input))
+		return FALSE;
+	const UINT64 started = rdk_latency_begin();
+	const BOOL result = freerdp_input_send_keyboard_event(input, flags, code);
+	rdk_latency_end(RDK_LATENCY_SEND, started);
+	return result;
 }
 
 static BOOL rdk_protocol_unicode(rdpInput* input, UINT16 flags, UINT16 code)
@@ -40,7 +46,10 @@ static BOOL rdk_protocol_unicode(rdpInput* input, UINT16 flags, UINT16 code)
 		fprintf(stderr, "rdk: Unicode input rejected: disabled in session settings\n");
 		return FALSE;
 	}
-	if (!freerdp_input_send_unicode_keyboard_event(input, flags, code))
+	const UINT64 started = rdk_latency_begin();
+	const BOOL result = freerdp_input_send_unicode_keyboard_event(input, flags, code);
+	rdk_latency_end(RDK_LATENCY_SEND, started);
+	if (!result)
 	{
 		fprintf(stderr, "rdk: FreeRDP Unicode input send failed\n");
 		return FALSE;
@@ -50,7 +59,12 @@ static BOOL rdk_protocol_unicode(rdpInput* input, UINT16 flags, UINT16 code)
 
 static BOOL rdk_protocol_pause(rdpInput* input)
 {
-	return rdk_input_ready(input) && freerdp_input_send_keyboard_pause_event(input);
+	if (!rdk_input_ready(input))
+		return FALSE;
+	const UINT64 started = rdk_latency_begin();
+	const BOOL result = freerdp_input_send_keyboard_pause_event(input);
+	rdk_latency_end(RDK_LATENCY_SEND, started);
+	return result;
 }
 
 void rdk_keyboard_layout(rdkKeyboard* keyboard, HKL layout)
