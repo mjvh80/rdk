@@ -1,6 +1,8 @@
 #include "rdk_capture.h"
 #include "rdk_latency.h"
 
+#define RDK_LOCK_SYNC_TAG ((ULONG_PTR)0x52444B4C)
+
 static __declspec(thread) rdkCapture* g_capture;
 
 void rdk_capture_init(rdkCapture* capture, HWND window)
@@ -9,6 +11,8 @@ void rdk_capture_init(rdkCapture* capture, HWND window)
 	capture->window = window;
 	capture->foreground = GetForegroundWindow;
 	capture->post = PostMessageW;
+	capture->keyState = GetKeyState;
+	capture->inject = SendInput;
 }
 
 void rdk_capture_set_active(rdkCapture* capture, BOOL active)
@@ -36,6 +40,9 @@ BOOL rdk_capture_route(rdkCapture* capture, int code, WPARAM message, const KBDL
 	    (message != WM_KEYDOWN && message != WM_KEYUP &&
 	     message != WM_SYSKEYDOWN && message != WM_SYSKEYUP))
 		return FALSE;
+	if ((event->flags & LLKHF_INJECTED) && event->dwExtraInfo == RDK_LOCK_SYNC_TAG &&
+	    (event->vkCode == VK_NUMLOCK || event->vkCode == VK_CAPITAL))
+		return FALSE;
 	const LONG state = InterlockedCompareExchange(&capture->state, 0, 0);
 	if (!(state & 1) || capture->foreground() != capture->window)
 		return FALSE;
@@ -55,7 +62,36 @@ BOOL rdk_capture_route(rdkCapture* capture, int code, WPARAM message, const KBDL
 		const DWORD error = GetLastError();
 		InterlockedExchange(&capture->error, error ? (LONG)error : ERROR_GEN_FAILURE);
 	}
-	return TRUE;
+	return event->vkCode != VK_NUMLOCK && event->vkCode != VK_CAPITAL;
+}
+
+BOOL rdk_capture_sync_locks(rdkCapture* capture, BOOL numLock, BOOL capsLock)
+{
+	const LONG state = InterlockedCompareExchange(&capture->state, 0, 0);
+	if (!(state & 1) || capture->foreground() != capture->window)
+		return TRUE;
+	const WORD virtualKeys[] = { VK_NUMLOCK, VK_CAPITAL };
+	const BOOL enabled[] = { numLock, capsLock };
+	INPUT inputs[4] = { 0 };
+	UINT count = 0;
+	for (size_t index = 0; index < ARRAYSIZE(virtualKeys); ++index)
+	{
+		if (((capture->keyState(virtualKeys[index]) & 1) != 0) == (enabled[index] != FALSE))
+			continue;
+		INPUT* down = &inputs[count++];
+		down->type = INPUT_KEYBOARD;
+		down->ki.wVk = virtualKeys[index];
+		down->ki.dwFlags = virtualKeys[index] == VK_NUMLOCK ? KEYEVENTF_EXTENDEDKEY : 0;
+		down->ki.dwExtraInfo = RDK_LOCK_SYNC_TAG;
+		inputs[count] = *down;
+		inputs[count++].ki.dwFlags |= KEYEVENTF_KEYUP;
+	}
+	if (!count)
+		return TRUE;
+	const UINT sent = capture->inject(count, inputs, sizeof(INPUT));
+	if (sent < count && (sent & 1))
+		(void)capture->inject(1, &inputs[sent], sizeof(INPUT));
+	return sent == count;
 }
 
 static LRESULT CALLBACK rdk_keyboard_hook(int code, WPARAM message, LPARAM data)

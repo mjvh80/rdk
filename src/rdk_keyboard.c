@@ -207,6 +207,31 @@ BOOL rdk_keyboard_release_all(rdkKeyboard* keyboard)
 	return ok;
 }
 
+BOOL rdk_keyboard_ctrl_alt_delete(rdkKeyboard* keyboard)
+{
+	if (!rdk_keyboard_flush(keyboard))
+		return FALSE;
+	const BOOL controlHeld = keyboard->remoteDown[RDP_SCANCODE_LCONTROL] ||
+	                         keyboard->remoteDown[RDP_SCANCODE_RCONTROL];
+	const BOOL altHeld = keyboard->remoteDown[RDP_SCANCODE_LMENU] ||
+	                     keyboard->remoteDown[RDP_SCANCODE_RMENU];
+	const BOOL deleteHeld = keyboard->remoteDown[RDP_SCANCODE_DELETE];
+	BOOL ok = !deleteHeld || rdk_scan(keyboard, RDP_SCANCODE_DELETE, FALSE);
+	if (ok && !controlHeld)
+		ok = rdk_scan(keyboard, RDP_SCANCODE_LCONTROL, TRUE);
+	if (ok && !altHeld)
+		ok = rdk_scan(keyboard, RDP_SCANCODE_LMENU, TRUE);
+	if (ok)
+		ok = rdk_scan(keyboard, RDP_SCANCODE_DELETE, TRUE);
+	if (!deleteHeld)
+		ok = rdk_scan(keyboard, RDP_SCANCODE_DELETE, FALSE) && ok;
+	if (!altHeld)
+		ok = rdk_scan(keyboard, RDP_SCANCODE_LMENU, FALSE) && ok;
+	if (!controlHeld)
+		ok = rdk_scan(keyboard, RDP_SCANCODE_LCONTROL, FALSE) && ok;
+	return ok;
+}
+
 static int rdk_numpad_digit(UINT16 code)
 {
 	switch (code)
@@ -276,6 +301,13 @@ static BOOL rdk_key_event(rdkKeyboard* keyboard, UINT16 code, BOOL down)
 		if (!down)
 			keyboard->suppressed[code] = FALSE;
 		return TRUE;
+	}
+	if (down && !wasDown && code == RDP_SCANCODE_END &&
+	    (keyboard->localDown[RDP_SCANCODE_LCONTROL] || keyboard->localDown[RDP_SCANCODE_RCONTROL]) &&
+	    (keyboard->localDown[RDP_SCANCODE_LMENU] || keyboard->localDown[RDP_SCANCODE_RMENU]))
+	{
+		keyboard->suppressed[code] = TRUE;
+		return rdk_keyboard_ctrl_alt_delete(keyboard);
 	}
 	if (down && (code == RDP_SCANCODE_F12 || code == RDP_SCANCODE_F11 || code == RDP_SCANCODE_F10) &&
 	    (keyboard->localDown[RDP_SCANCODE_LCONTROL] || keyboard->localDown[RDP_SCANCODE_RCONTROL]) &&

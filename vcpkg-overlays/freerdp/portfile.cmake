@@ -10,6 +10,7 @@ vcpkg_from_github(
         install-layout.patch
         windows-linkage.patch
         audio-channel-mix.patch
+        windows-keepalive.patch
 )
 file(WRITE "${SOURCE_PATH}/.source_version" "${VERSION}-vcpkg")
 file(WRITE "${SOURCE_PATH}/CMakeCPack.cmake" "")

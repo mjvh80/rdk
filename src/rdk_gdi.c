@@ -29,6 +29,8 @@
 #include <freerdp/event.h>           /* ChannelConnected / ChannelDisconnected events */
 
 static const wchar_t* const RDK_WINDOW_CLASS = L"rdkWindowClass";
+static const UINT_PTR RDK_LOCK_TIMER = 1;
+static const UINT RDK_SC_CTRL_ALT_DELETE = 0x1000;
 
 /* ---- rendering + input ------------------------------------------------- */
 
@@ -55,10 +57,37 @@ static void rdk_input_result(rdkContext* rdk, BOOL ok)
 	}
 }
 
+static void rdk_cancel_lock_sync(rdkContext* rdk)
+{
+	if (rdk->lockIndicatorsPending)
+	{
+		KillTimer(rdk->hwnd, RDK_LOCK_TIMER);
+		rdk->lockIndicatorsPending = FALSE;
+	}
+}
+
+static BOOL rdk_set_keyboard_indicators(rdpContext* context, UINT16 flags)
+{
+	rdkContext* rdk = (rdkContext*)context;
+	if (!rdk->focused || rdk->quit)
+		return TRUE;
+	const LONG state = InterlockedCompareExchange(&rdk->capture.state, 0, 0);
+	const WPARAM indicators = MAKEWPARAM(flags, LOWORD(state));
+	if (!rdk_capture_current(&rdk->capture, indicators))
+		return TRUE;
+	rdk->lockIndicators = indicators;
+	rdk->lockIndicatorsPending = SetTimer(rdk->hwnd, RDK_LOCK_TIMER, USER_TIMER_MINIMUM, NULL) != 0;
+	if (!rdk->lockIndicatorsPending)
+		fprintf(stderr, "rdk: could not schedule local lock-key synchronization (%lu)\n", GetLastError());
+	return TRUE;
+}
+
 static void rdk_on_key(rdkContext* rdk, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	if (!rdk->focused || rdk->quit)
 		return;
+	if (wParam == VK_NUMLOCK || wParam == VK_CAPITAL)
+		rdk_cancel_lock_sync(rdk);
 	rdk_input_result(rdk, rdk_keyboard_key(&rdk->keyboard, msg, wParam, lParam));
 	if (rdk->keyboard.reconnect && !rdk->inputFailed)
 	{
@@ -83,6 +112,8 @@ static void rdk_on_key(rdkContext* rdk, UINT msg, WPARAM wParam, LPARAM lParam)
 
 static void rdk_release_mouse(rdkContext* rdk)
 {
+	if (rdk->recovering)
+		return;
 	rdpInput* input = ((rdpContext*)rdk)->input;
 	const UINT16 buttons[] = { PTR_FLAGS_BUTTON1, PTR_FLAGS_BUTTON2, PTR_FLAGS_BUTTON3 };
 	for (size_t index = 0; index < ARRAYSIZE(buttons); ++index)
@@ -115,7 +146,7 @@ static void rdk_send_focus_in(rdkContext* rdk)
 static void rdk_on_mouse(rdkContext* rdk, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	rdpInput* input = ((rdpContext*)rdk)->input;
-	if (rdk->quit)
+	if (rdk->quit || rdk->recovering)
 		return;
 	if (msg != WM_MOUSEMOVE)
 	{
@@ -194,6 +225,7 @@ static void rdk_focus_out(rdkContext* rdk)
 {
 	if (!rdk)
 		return;
+	rdk_cancel_lock_sync(rdk);
 	rdk_capture_set_active(&rdk->capture, FALSE);
 	if (!rdk->focused)
 		return;
@@ -210,6 +242,35 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 	switch (msg)
 	{
+		case WM_INITMENUPOPUP:
+			EnableMenuItem(GetSystemMenu(hwnd, FALSE), RDK_SC_CTRL_ALT_DELETE,
+			    MF_BYCOMMAND | ((rdk && !rdk->quit && !rdk->inputFailed && !rdk->recovering) ? MF_ENABLED : MF_GRAYED));
+			return DefWindowProcW(hwnd, msg, wParam, lParam);
+		case WM_SYSCOMMAND:
+			if ((wParam & 0xFFF0) == RDK_SC_CTRL_ALT_DELETE)
+			{
+				if (rdk && !rdk->quit && !rdk->inputFailed && !rdk->recovering)
+					rdk_input_result(rdk, rdk_keyboard_ctrl_alt_delete(&rdk->keyboard));
+				return 0;
+			}
+			return DefWindowProcW(hwnd, msg, wParam, lParam);
+		case WM_TIMER:
+			if (wParam != RDK_LOCK_TIMER)
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			if (rdk && rdk->lockIndicatorsPending)
+			{
+				if (!rdk->focused || rdk->quit ||
+				    !rdk_capture_current(&rdk->capture, rdk->lockIndicators))
+					rdk_cancel_lock_sync(rdk);
+				else if (rdk_keyboard_idle(&rdk->keyboard))
+				{
+					rdk_cancel_lock_sync(rdk);
+					const UINT16 flags = LOWORD(rdk->lockIndicators);
+					if (!rdk_capture_sync_locks(&rdk->capture, flags & KBD_SYNC_NUM_LOCK, flags & KBD_SYNC_CAPS_LOCK))
+						fprintf(stderr, "rdk: could not update local Num Lock/Caps Lock state\n");
+				}
+			}
+			return 0;
 		case RDK_WM_TASKBAR_RECONNECT:
 			if (rdk && !rdk->quit)
 			{
@@ -254,7 +315,7 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			return 0;
 		}
 		case WM_SETFOCUS:
-			if (rdk && !IsIconic(hwnd))
+			if (rdk && !rdk->recovering && !IsIconic(hwnd))
 			{
 				rdk->focused = TRUE;
 				rdk_capture_set_active(&rdk->capture, TRUE);
@@ -484,9 +545,20 @@ static HWND rdk_create_window(rdkContext* rdk)
 	wc.lpszClassName = RDK_WINDOW_CLASS;
 	RegisterClassExW(&wc); /* harmless if already registered */
 
-	return CreateWindowExW(WS_EX_TOPMOST | WS_EX_APPWINDOW, RDK_WINDOW_CLASS, L"rdk",
+	HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_APPWINDOW, RDK_WINDOW_CLASS, L"rdk",
 	    WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX, rdk->winX, rdk->winY, rdk->winW, rdk->winH,
 	    NULL, NULL, wc.hInstance, rdk);
+	if (!window)
+		return NULL;
+	HMENU menu = GetSystemMenu(window, FALSE);
+	if (!menu || !InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, RDK_SC_CTRL_ALT_DELETE,
+	                         L"Send Ctrl+Alt+Delete\tCtrl+Alt+End") ||
+	    !InsertMenuW(menu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL))
+	{
+		DestroyWindow(window);
+		return NULL;
+	}
+	return window;
 }
 
 BOOL rdk_gdi_post_connect(freerdp* instance)
@@ -565,6 +637,7 @@ BOOL rdk_gdi_post_connect(freerdp* instance)
 	rdk->origEndPaint = update->EndPaint;
 	update->EndPaint = rdk_end_paint;
 	update->DesktopResize = rdk_desktop_resize;
+	update->SetKeyboardIndicators = rdk_set_keyboard_indicators;
 
 	/* Bind the RDPGFX channel to the GDI framebuffer once it connects. Must be
 	 * subscribed before the dynamic channels come up (i.e. here in PostConnect,
@@ -581,6 +654,33 @@ void rdk_gdi_activate(rdkContext* rdk)
 	rdk_force_foreground(rdk->hwnd);
 }
 
+BOOL rdk_gdi_recovery(rdkContext* rdk, BOOL active)
+{
+	rdk->recovering = active;
+	if (active)
+	{
+		rdk_cancel_lock_sync(rdk);
+		rdk->focused = FALSE;
+		rdk_capture_set_active(&rdk->capture, FALSE);
+		rdk->keyboard.altPending = FALSE;
+		rdk->keyboard.pendingCount = 0;
+		if (GetCapture() == rdk->hwnd)
+			ReleaseCapture();
+		if (rdk->notice)
+			ShowWindow(rdk->notice, SW_HIDE);
+		SetWindowTextW(rdk->hwnd, L"rdk - Reconnecting");
+	}
+	else
+	{
+		rdk_input_result(rdk, rdk_keyboard_release_all(&rdk->keyboard));
+		rdk_release_mouse(rdk);
+		SetWindowTextW(rdk->hwnd, L"rdk");
+		if (!rdk->quit && GetForegroundWindow() == rdk->hwnd && GetFocus() == rdk->hwnd)
+			SendMessageW(rdk->hwnd, WM_SETFOCUS, 0, 0);
+	}
+	return !rdk->inputFailed;
+}
+
 void rdk_gdi_post_disconnect(freerdp* instance)
 {
 	rdpContext* context = instance->context;
@@ -590,6 +690,7 @@ void rdk_gdi_post_disconnect(freerdp* instance)
 	fflush(stdout);
 	rdk_clipboard_free(rdk->clipboard);
 	rdk->clipboard = NULL;
+	rdk_cancel_lock_sync(rdk);
 	rdk_capture_stop(&rdk->capture);
 	printf("rdk: shutdown: stopping microphone change monitoring\n");
 	fflush(stdout);

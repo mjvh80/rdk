@@ -312,6 +312,102 @@ static BOOL quit_and_failures(void)
 	return TRUE;
 }
 
+static BOOL ctrl_alt_delete_shortcut(void)
+{
+	for (UINT controlSide = 0; controlSide < 2; ++controlSide)
+	{
+		for (UINT altSide = 0; altSide < 2; ++altSide)
+		{
+			for (UINT modifiers = 0; modifiers < 4; ++modifiers)
+			{
+				reset();
+				const UINT16 control = controlSide ? RDP_SCANCODE_RCONTROL : RDP_SCANCODE_LCONTROL;
+				const UINT16 alt = altSide ? RDP_SCANCODE_RMENU : RDP_SCANCODE_LMENU;
+				if (modifiers & 2) CHECK(key(VK_MENU, alt, TRUE));
+				if (modifiers & 1) CHECK(key(VK_CONTROL, control, TRUE));
+				CHECK(rdk_keyboard_key(&keyboard, WM_KEYDOWN, VK_END,
+				    ((LPARAM)0x4F << 16) | ((LPARAM)1 << 24) | 3));
+				if (modifiers == 3)
+				{
+					CHECK(eventCount == 4);
+					CHECK(expect(2, FALSE, KBD_FLAGS_EXTENDED, 0x53));
+					CHECK(expect(3, FALSE, KBD_FLAGS_EXTENDED | KBD_FLAGS_RELEASE, 0x53));
+					CHECK(keyboard.remoteDown[control] && keyboard.remoteDown[alt]);
+					CHECK(!keyboard.remoteDown[RDP_SCANCODE_END]);
+					CHECK(key(VK_END, RDP_SCANCODE_END, TRUE));
+					CHECK(eventCount == 4);
+				}
+				else
+					CHECK(keyboard.remoteDown[RDP_SCANCODE_END]);
+				if (modifiers & 1) CHECK(key(VK_CONTROL, control, FALSE));
+				if (modifiers & 2) CHECK(key(VK_MENU, alt, FALSE));
+				const size_t beforeRelease = eventCount;
+				CHECK(key(VK_END, RDP_SCANCODE_END, FALSE));
+				if (modifiers == 3) CHECK(eventCount == beforeRelease);
+				CHECK(rdk_keyboard_idle(&keyboard));
+				CHECK(!keyboard.quit && !keyboard.reconnect && !keyboard.minimize);
+				CHECK(tap(RDP_SCANCODE_END));
+				CHECK(expect(eventCount - 2, FALSE, KBD_FLAGS_EXTENDED, 0x4F));
+			}
+		}
+	}
+	reset();
+	CHECK(key(VK_END, RDP_SCANCODE_END, TRUE));
+	CHECK(key(VK_CONTROL, RDP_SCANCODE_LCONTROL, TRUE));
+	CHECK(key(VK_MENU, RDP_SCANCODE_LMENU, TRUE));
+	CHECK(key(VK_END, RDP_SCANCODE_END, TRUE));
+	CHECK(expect(3, FALSE, KBD_FLAGS_EXTENDED | KBD_FLAGS_DOWN, 0x4F));
+	CHECK(rdk_keyboard_release_all(&keyboard));
+	reset();
+	CHECK(key(VK_CONTROL, RDP_SCANCODE_LCONTROL, TRUE));
+	CHECK(key(VK_MENU, RDP_SCANCODE_LMENU, TRUE));
+	CHECK(tap(RDP_SCANCODE_NUMPAD1));
+	CHECK(expect(2, FALSE, 0, 0x4F));
+	CHECK(rdk_keyboard_release_all(&keyboard));
+	return TRUE;
+}
+
+static BOOL ctrl_alt_delete_command(void)
+{
+	CHECK(rdk_keyboard_ctrl_alt_delete(&keyboard));
+	CHECK(eventCount == 6);
+	CHECK(expect(0, FALSE, 0, 0x1D));
+	CHECK(expect(1, FALSE, 0, 0x38));
+	CHECK(expect(2, FALSE, KBD_FLAGS_EXTENDED, 0x53));
+	CHECK(expect(3, FALSE, KBD_FLAGS_EXTENDED | KBD_FLAGS_RELEASE, 0x53));
+	CHECK(expect(4, FALSE, KBD_FLAGS_RELEASE, 0x38));
+	CHECK(expect(5, FALSE, KBD_FLAGS_RELEASE, 0x1D));
+	CHECK(rdk_keyboard_idle(&keyboard));
+	CHECK(key(VK_MENU, RDP_SCANCODE_LMENU, TRUE));
+	CHECK(keyboard.altPending);
+	CHECK(rdk_keyboard_ctrl_alt_delete(&keyboard));
+	CHECK(!keyboard.altPending && keyboard.remoteDown[RDP_SCANCODE_LMENU]);
+	CHECK(!keyboard.remoteDown[RDP_SCANCODE_LCONTROL]);
+	CHECK(key(VK_MENU, RDP_SCANCODE_LMENU, FALSE));
+	CHECK(key(VK_DELETE, RDP_SCANCODE_DELETE, TRUE));
+	CHECK(rdk_keyboard_ctrl_alt_delete(&keyboard));
+	CHECK(keyboard.remoteDown[RDP_SCANCODE_DELETE]);
+	CHECK(key(VK_DELETE, RDP_SCANCODE_DELETE, FALSE));
+	for (size_t failure = 1; failure <= 6; ++failure)
+	{
+		reset();
+		failAt = failure;
+		CHECK(!rdk_keyboard_ctrl_alt_delete(&keyboard));
+		CHECK(rdk_keyboard_release_all(&keyboard));
+		for (size_t index = 0; index < RDK_KEY_COUNT; ++index)
+			CHECK(!keyboard.remoteDown[index]);
+	}
+	reset();
+	CHECK(key(VK_CONTROL, RDP_SCANCODE_RCONTROL, TRUE));
+	CHECK(key(VK_MENU, RDP_SCANCODE_RMENU, TRUE));
+	failAt = 3;
+	CHECK(!key(VK_END, RDP_SCANCODE_END, TRUE));
+	CHECK(keyboard.suppressed[RDP_SCANCODE_END]);
+	CHECK(rdk_keyboard_release_all(&keyboard));
+	CHECK(!keyboard.suppressed[RDP_SCANCODE_END]);
+	return TRUE;
+}
+
 static BOOL rapid_sequences(void)
 {
 	for (size_t index = 0; index < 250; ++index)
@@ -376,7 +472,7 @@ int main(void)
 {
 	BOOL (*tests[])(void) = { decimal_codes, hex_codes, shortcuts, focus_loss,
 		repeats_and_fixups, early_alt_release, fallback_and_mouse, quit_and_failures, rapid_sequences,
-		startup_text, configure_after_command_line };
+		startup_text, configure_after_command_line, ctrl_alt_delete_shortcut, ctrl_alt_delete_command };
 	for (size_t index = 0; index < ARRAYSIZE(tests); ++index)
 	{
 		reset();

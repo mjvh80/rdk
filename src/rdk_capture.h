@@ -19,6 +19,8 @@ typedef struct
 	LONG error;
 	HWND (WINAPI *foreground)(void);
 	BOOL (WINAPI *post)(HWND, UINT, WPARAM, LPARAM);
+	SHORT (WINAPI *keyState)(int);
+	UINT (WINAPI *inject)(UINT, LPINPUT, int);
 } rdkCapture;
 
 void rdk_capture_init(rdkCapture* capture, HWND window);
@@ -28,5 +30,6 @@ void rdk_capture_set_active(rdkCapture* capture, BOOL active);
 DWORD rdk_capture_error(rdkCapture* capture);
 BOOL rdk_capture_current(rdkCapture* capture, WPARAM key);
 BOOL rdk_capture_route(rdkCapture* capture, int code, WPARAM message, const KBDLLHOOKSTRUCT* event);
+BOOL rdk_capture_sync_locks(rdkCapture* capture, BOOL numLock, BOOL capsLock);
 
 #endif

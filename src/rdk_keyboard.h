@@ -47,6 +47,7 @@ void rdk_keyboard_layout(rdkKeyboard* keyboard, HKL layout);
 BOOL rdk_keyboard_key(rdkKeyboard* keyboard, UINT message, WPARAM vk, LPARAM data);
 BOOL rdk_keyboard_flush(rdkKeyboard* keyboard);
 BOOL rdk_keyboard_release_all(rdkKeyboard* keyboard);
+BOOL rdk_keyboard_ctrl_alt_delete(rdkKeyboard* keyboard);
 BOOL rdk_keyboard_unicode(rdkKeyboard* keyboard, UINT32 codepoint);
 BOOL rdk_keyboard_tap(rdkKeyboard* keyboard, UINT16 scan);
 BOOL rdk_keyboard_text_next(rdkKeyboard* keyboard, const WCHAR** text);

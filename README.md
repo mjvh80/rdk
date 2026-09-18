@@ -151,6 +151,20 @@ Win+R, the Windows key, and Alt+Tab are forwarded to the remote desktop while
 rdk has foreground keyboard focus. Minimize, reconnect, and quit shortcuts remain
 local; F10 and F11 without both Ctrl and Shift are forwarded normally.
 
+Press **Ctrl+Alt+End** while rdk is focused to send **Ctrl+Alt+Delete** to the
+remote session. Hold Ctrl and Alt before pressing the dedicated End key;
+either side's modifiers work. End is not forwarded, and holding it does not
+repeat the command. Numpad End/1 is unchanged. The remote security screen and
+available actions depend on the server's Windows policies. Physical
+Ctrl+Alt+Delete remains handled by local Windows; rdk does not inject it locally.
+
+Alternatively, **Shift+right-click the individual rdk window's taskbar entry**
+and choose **Send Ctrl+Alt+Delete** from the classic window menu. For grouped
+windows, use the individual window thumbnail's menu. This command targets only
+that window's session, works while unfocused or minimized, and does not reconnect
+or show a confirmation dialog. It is not a Tasks jump-list command. It is useful
+when an outer remote-desktop client intercepts Ctrl+Alt+End in a nested session.
+
 To use the local screens without disconnecting, right-click the running rdk
 taskbar button and choose **Minimize** under Tasks. This is a Windows jump-list
 task, separate from the classic window menu shown by Shift+right-click (which
@@ -181,6 +195,57 @@ window icons sized for display scaling. The device-change notice uses themed
 Windows controls, Segoe UI text, and a DPI-aware layout. Later remains the default
 action, and appearing notices do not take focus. The icon can be regenerated
 with `./tools/New-AppIcon.ps1`.
+
+## Connection Recovery
+
+Add `/recover` to retry an established session after a temporary network or VPN
+interruption. It is opt-in; without it, connection errors retain the previous
+exit behavior. Initial connection failures are not retried.
+
+```powershell
+.\build\Release\rdk.exe /v:HOST /recover
+```
+
+After a retryable failure is detected, rdk shows a native **Connection Recovery**
+dialog with an attempt countdown and **Cancel**. Retry delays are 1, 2, 4, 8,
+then 15 seconds, within a two-minute budget including connection attempts.
+Cancel or closing the dialog stops retries and exits the client. The dialog
+runs independently of the connection thread, so it can request cancellation
+during a blocked attempt. FreeRDP and device teardown must still cooperate;
+this is not a hard guarantee that all cleanup finishes within two minutes.
+
+Recovery uses FreeRDP's in-place reconnect and enables its reconnect-cookie
+support. It retains the window and in-memory connection settings. The server
+decides whether the original session is still available. **Neither `/input`
+nor `/text` is replayed or continued after automatic recovery**, even when the
+outage interrupted startup input. Explicit Reconnect still replays `/input`.
+Keyboard capture and remote mouse input pause during recovery; held remote
+keys/buttons are released after connection restoration. No outage keystrokes
+are queued for later delivery. Minimized windows stay minimized, and successful
+recovery does not forcibly foreground rdk over another application.
+
+Transport/connect, DNS, KDC-unreachable and activation-timeout failures may be
+retried. Authentication, password/account, TLS/security negotiation errors,
+server-supplied disconnect/logoff reasons, and intentional local quit do not
+trigger retries. A non-retryable error during recovery ends it immediately.
+Sleep/resume continues to use the separate confirmation flow below.
+
+The FreeRDP overlay now applies its Windows TCP keepalive settings when
+auto-reconnection is enabled: defaults are 5 seconds idle, 2 seconds between
+probes, and 3 probes. This helps detect silent VPN drops instead of relying on
+long Windows defaults. Detection time is separate from the retry budget and
+depends on traffic, transport, Windows, and network behavior; it is not a
+guaranteed outage-detection deadline. Gateway transports need live verification.
+Keepalive configuration failures produce a warning. No VPN, firewall, or
+system-wide TCP settings are changed, and an explicit disabled keepalive option
+is respected.
+
+Deploy the rebuilt files together from `build/Release`, including `rdk.exe`,
+`freerdp3.dll`, `freerdp-client3.dll`, and `winpr3.dll`. An older FreeRDP DLL will
+not contain the Windows keepalive fix. Recovery attempts and results are printed
+without credentials or input content; the diagnostic report records recovery
+entry, success, and the final reason if it stops. Audio/video calls and in-flight
+clipboard transfers can still be interrupted; recovery does not replay them.
 
 ## Sleep And Resume
 
@@ -261,6 +326,16 @@ dismissing local credential prompts or dialogs shown before the session connects
   release. Mouse button/wheel gestures also flush pending Alt input.
 - Coalesced key repeat counts are preserved. Extended navigation keys are not
   mistaken for numpad digits; NumLock, right Shift, and Pause have Win32 fixups.
+- Num Lock and Caps Lock update local Windows normally while each event is
+  forwarded once to the remote session. Keyboard indicators and firmware that
+  use the local host's lock state can therefore follow changes made in rdk.
+  Returning to rdk synchronizes the remote locks to the current local state.
+  Remote Num Lock/Caps Lock indicator changes update local state only while
+  rdk is focused, after queued input and held keys have been handled. These
+  local updates are tagged so they are not forwarded back to the server.
+  Focus loss or newer local lock-key input cancels a pending indicator update.
+  Windows can block local input injection; a warning is printed if a remote
+  indicator update cannot be applied. Scroll Lock handling is unchanged.
 - Focus loss cancels incomplete composition and releases forwarded keys and
   mouse buttons. Quit releases held keyboard keys before disconnecting.
 - An invalid sequence or exhausted 128-event buffer falls back to ordered raw
@@ -399,8 +474,9 @@ it; Reconnect disconnects and establishes a fresh connection using the same
 in-memory credentials and options. It replays `/input` from the beginning, but
 does not replay `/text`, sign out, or save new credentials.
 Reconnection can interrupt a meeting and depends on the
-server reconnecting the same user session. There are no automatic reconnects
-or retry loops. Some driver or FreeRDP audio errors can still end the connection
+server reconnecting the same user session. Device changes do not automatically
+reconnect; `/recover` applies only to retryable connection interruptions, not
+device configuration changes. Some driver or FreeRDP audio errors can still end the connection
 before a device-change notice can be shown.
 
 Exit and reconnect print flushed `rdk: shutdown:` progress messages around
@@ -518,9 +594,20 @@ separate an rdk-specific problem from a shared remote/network problem.
 
 ## Verification
 
-With `BUILD_TESTING` enabled (the default), CTest registers `power`, `audio_encode`, `crash`, `latency`, `keyboard`, `startup`, `cli`,
+With `BUILD_TESTING` enabled (the default), CTest registers `recovery`, `power`, `audio_encode`, `crash`, `latency`, `keyboard`, `startup`, `cli`,
 `graphics`, `credentials`, `capture`, `pointer`, `display`, `media`, `media_log`, `camera`, `camera_mf`,
 `session`, `window`, `taskbar`, `clipboard_files`, `clipboard`, and `clipboard_native`.
+Recovery tests check transient/terminal error classification, server disconnect
+precedence and backoff with a fake clock. Private-desktop native dialogs exercise
+Cancel during a simulated connection attempt, deadline signaling, successful
+recovery after a transient failure, and abort-handle lifetime. Loopback-only
+FreeRDP connection attempts verify that the patched DLL sets and reads back
+the Windows keepalive values when enabled, and does not apply them by default.
+Window tests verify input gating while recovery is active. No real server login
+or VPN changes occur in these tests. Live verification requires dropping and
+restoring the VPN after a connection with `/recover`, checking normal input and
+unchanged startup text, then repeating with Cancel and a remote logoff. Verify
+media and clipboard behavior separately if those channels are enabled.
 The audio encoder test uses synthetic silence at 44.1 kHz and the deployed
 FreeRDP/FFmpeg DLLs to verify mono/stereo AAC channel conversion and unchanged
 channel counts over multiple packets. It opens no microphone or network session.
@@ -559,8 +646,21 @@ cache precedence, prompt cancellation, save-after-success, failure cleanup,
 and corrupt entries. It does not access real saved passwords or verify NLA.
 The capture suite checks Win+R ordering, foreground scope, stale-event rejection,
 Alt+Tab, the local exit chord, injected scancodes, repeat events, and queue
-failure. Hook installation/removal is smoke-tested with capture inactive; no
-real keyboard input is recorded or injected by these tests.
+failure. Num Lock/Caps Lock tests check local passthrough, single remote
+forwarding, and tagged indicator updates without feedback. Window tests cover
+indicator batching, held-key deferral, focus generations, and cancellation by
+new local input. Hook installation/removal is smoke-tested with capture
+inactive; no real keyboard input is recorded or injected by these tests.
+Live verification still requires pressing both locks while focused on rdk,
+checking the keyboard LEDs and remote typing, then switching to a local app
+and back. Also check remote on-screen keyboard toggles while rdk is focused.
+Ctrl+Alt+Delete regressions record the exact remote scan sequence, modifier
+preservation, End repeat/release suppression, numpad passthrough, and send-failure
+cleanup. Capture tests check foreground gating and stale focus messages. Native
+window tests verify the per-window menu with two separate input contexts,
+including unfocused/minimized dispatch and shutdown/failure handling. These tests
+do not open a real Windows security screen; verify both entry points in a live
+session and press Escape to return, then check normal typing and shortcuts.
 The pointer suite exercises registered FreeRDP graphics callbacks without a
 connection. It checks native cursor pixels, hotspots, padded masks, transparency,
 cached selection, hidden/default states, invalid shapes, and handle cleanup.

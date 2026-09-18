@@ -49,6 +49,9 @@ typedef struct
 
 	rdkKeyboard keyboard;
 	rdkCapture capture;
+	WPARAM lockIndicators;
+	BOOL lockIndicatorsPending;
+	BOOL recovering;
 	BOOL focused;
 	BOOL desktopReady;
 	BOOL inputFailed;
@@ -64,6 +67,7 @@ void rdk_media_notice(rdkContext* rdk);
 /* PostConnect/PostDisconnect: framebuffer + window lifecycle. */
 BOOL rdk_gdi_post_connect(freerdp* instance);
 void rdk_gdi_activate(rdkContext* rdk);
+BOOL rdk_gdi_recovery(rdkContext* rdk, BOOL active);
 void rdk_gdi_post_disconnect(freerdp* instance);
 
 #endif /* RDK_CLIENT_H */

@@ -26,6 +26,14 @@ if(NOT report MATCHES "rdk: exiting: invalid /input token sequence" OR
 endif()
 file(REMOVE "${report_path}")
 
+foreach(option /recover /RECOVER)
+    execute_process(COMMAND "${RDK_EXE}" "${option}" /help
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0 OR NOT output MATCHES "/recover" OR output MATCHES "rdk: recovery: attempt")
+        message(FATAL_ERROR "Recovery help ${option}: result=${result}, ${output}${error}")
+    endif()
+endforeach()
+
 foreach(option /latency /LATENCY)
     execute_process(COMMAND "${RDK_EXE}" "${option}" /help
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
@@ -60,6 +68,10 @@ endif()
 if(NOT output MATCHES "Ctrl[+]Shift[+]F10" OR NOT output MATCHES "Ctrl[+]Shift[+]F11" OR
    NOT output MATCHES "Ctrl[+]Shift[+]F12")
     message(FATAL_ERROR "Help must list local minimize, reconnect, and quit shortcuts: ${output}")
+endif()
+if(NOT output MATCHES "Ctrl[+]Alt[+]End sends Ctrl[+]Alt[+]Delete remotely" OR
+   NOT output MATCHES "Shift[+]right-click a window's taskbar entry for Send Ctrl[+]Alt[+]Delete")
+    message(FATAL_ERROR "Help must list the remote security shortcut and per-window menu: ${output}")
 endif()
 foreach(option /screen:1,2 /monitors:1,2)
     execute_process(COMMAND "${RDK_EXE}" "${option}" /list:monitor

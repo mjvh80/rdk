@@ -1,0 +1,38 @@
+diff --git a/libfreerdp/core/tcp.c b/libfreerdp/core/tcp.c
+--- a/libfreerdp/core/tcp.c
++++ b/libfreerdp/core/tcp.c
+@@ -1013,6 +1013,34 @@
+ 		WLog_WARN(TAG, "setsockopt() SOL_SOCKET, SO_KEEPALIVE");
+ 	}
+ 
++#ifdef _WIN32
++	if (keepalive && freerdp_settings_get_bool(settings, FreeRDP_AutoReconnectionEnabled))
++	{
++		const int options[] = { TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT };
++		const UINT32 values[] = {
++			freerdp_settings_get_uint32(settings, FreeRDP_TcpKeepAliveDelay),
++			freerdp_settings_get_uint32(settings, FreeRDP_TcpKeepAliveInterval),
++			freerdp_settings_get_uint32(settings, FreeRDP_TcpKeepAliveRetries)
++		};
++		BOOL applied = TRUE;
++		for (size_t index = 0; index < ARRAYSIZE(options); ++index)
++		{
++			UINT32 actual = 0;
++			socklen_t length = sizeof(actual);
++			if (!values[index] ||
++			    setsockopt(sockfd, IPPROTO_TCP, options[index], (const char*)&values[index], sizeof(values[index])) < 0 ||
++			    getsockopt(sockfd, IPPROTO_TCP, options[index], (char*)&actual, &length) < 0 || actual != values[index])
++			{
++				applied = FALSE;
++				WLog_WARN(TAG, "Could not apply Windows TCP keepalive option %d (error=%d)", options[index], WSAGetLastError());
++			}
++		}
++		if (applied)
++			WLog_DBG(TAG, "Windows TCP keepalive configured: idle=%" PRIu32 " interval=%" PRIu32 " probes=%" PRIu32,
++			         values[0], values[1], values[2]);
++	}
++#endif
++
+ #ifndef _WIN32
+ #ifdef TCP_KEEPIDLE
+ 	optval = keepalive ? freerdp_settings_get_uint32(settings, FreeRDP_TcpKeepAliveDelay) : 0;

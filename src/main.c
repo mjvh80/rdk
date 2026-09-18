@@ -30,6 +30,7 @@
 #include "rdk_latency.h"
 #include "rdk_crash.h"
 #include "rdk_power.h"
+#include "rdk_recovery.h"
 #include "rdk_camera.h"
 #include "rdk_session.h"
 #include "rdk_startup.h"
@@ -50,6 +51,7 @@ static DWORD g_charDelayMs = 0;
 static BOOL g_promptCredentials = FALSE;
 static BOOL g_cameraEnabled = FALSE;
 static BOOL g_latency = FALSE;
+static BOOL g_recover = FALSE;
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -198,11 +200,11 @@ static BOOL rdk_startup_ready(rdkContext* rdk)
 	       freerdp_is_active_state((rdpContext*)rdk) && rdk_startup_keys_released();
 }
 
-static int rdk_run(rdkContext* rdk, rdkPower* power)
+static int rdk_run(rdkContext* rdk, rdkPower* power, BOOL replayStartup)
 {
 	rdpContext* context = (rdpContext*)rdk;
 	rdkStartup startup;
-	rdk_startup_init(&startup, g_autoText, g_autoTokens, g_startupDelayMs, g_charDelayMs);
+	rdk_startup_init(&startup, replayStartup ? g_autoText : NULL, g_autoTokens, g_startupDelayMs, g_charDelayMs);
 	BOOL activated = FALSE;
 	if (startup.next && *startup.next)
 	{
@@ -221,7 +223,8 @@ static int rdk_run(rdkContext* rdk, rdkPower* power)
 		}
 		if (!activated && freerdp_is_active_state(context))
 		{
-			rdk_gdi_activate(rdk);
+			if (replayStartup && !IsIconic(rdk->hwnd))
+				rdk_gdi_activate(rdk);
 			activated = TRUE;
 		}
 		HANDLE handles[RDK_MAX_HANDLES];
@@ -378,6 +381,66 @@ static void rdk_report_exit(const char* action, const char* reason, int result, 
 	fflush(stderr);
 }
 
+typedef struct
+{
+	rdkContext* rdk;
+	rdkPower* power;
+} rdkRecoveryWindow;
+
+static BOOL rdk_recovery_events(void* user)
+{
+	rdkRecoveryWindow* window = user;
+	MSG message;
+	UINT processed = 0;
+	while (processed++ < 64 && PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
+	{
+		if (message.message == WM_QUIT)
+		{
+			window->rdk->quit = TRUE;
+			window->rdk->stopReason = "Windows quit message received during recovery";
+			break;
+		}
+		DispatchMessageW(&message);
+	}
+	return !window->rdk->quit && !rdk_power_interrupted(window->power);
+}
+
+static int rdk_run_connected(rdkContext* rdk, rdkPower* power)
+{
+	rdpContext* context = (rdpContext*)rdk;
+	BOOL replayStartup = TRUE;
+	for (;;)
+	{
+		const int result = rdk_run(rdk, power, replayStartup);
+		if (!g_recover || rdk_power_interrupted(power) || rdk->reconnectRequested ||
+		    (rdk->quit && !rdk->inputFailed) ||
+		    !rdk_recovery_retryable(freerdp_get_last_error(context), freerdp_error_info(context->instance)))
+			return result;
+		rdk_report_exit("recovering", "connection interrupted; attempting transport recovery", result, context);
+		rdk_crash_stage("recovering-connection");
+		rdk->quit = FALSE;
+		rdk->inputFailed = FALSE;
+		rdk->stopReason = NULL;
+		(void)rdk_gdi_recovery(rdk, TRUE);
+		rdkRecoveryWindow window = { rdk, power };
+		const DWORD status = rdk_recovery_run(context->instance, rdk_recovery_events, &window);
+		if (status != ERROR_SUCCESS)
+		{
+			if (!rdk->stopReason)
+				rdk->stopReason = status == ERROR_CANCELLED ? "connection recovery cancelled" :
+				    status == ERROR_TIMEOUT ? "connection recovery time limit reached" :
+				    status == ERROR_CONNECTION_ABORTED ? "connection recovery stopped after a non-retryable error" :
+				    "connection recovery controller failed";
+			return status == ERROR_CANCELLED ? 0 : 1;
+		}
+		if (!rdk_gdi_recovery(rdk, FALSE))
+			return 1;
+		rdk_crash_message("rdk: connection recovered; startup input suppressed for this recovery");
+		rdk_crash_stage("connected-event-loop");
+		replayStartup = FALSE;
+	}
+}
+
 static void rdk_usage(void)
 {
 	printf("rdk - fullscreen, multi-monitor RDP client with reliable input\n\n"
@@ -401,6 +464,7 @@ static void rdk_usage(void)
 	       "  /gfx:avc420           opt in to H.264 AVC420 for comparison\n"
 	       "  (no /gfx option)      keep previous non-AVC graphics behavior\n"
 	       "  /latency              log timing summaries every 5s (no key values/text)\n"
+	       "  /recover              retry interrupted sessions for up to 2 minutes (Cancel available)\n"
 	       "  /crash-dump           also write a minidump on fatal exceptions (sensitive memory)\n"
 	       "  /microphone           redirect microphone; notify on default-device changes\n"
 	       "  /list:microphone      show local input devices, default, mute and format queries\n"
@@ -412,6 +476,8 @@ static void rdk_usage(void)
 	       "Left Alt+numpad codes are composed locally; other keys use scancodes.\n"
 	       "Startup input pauses while the window is unfocused or a key is held.\n"
 	       "Certificates are auto-accepted for this proof of concept.\n"
+	       "Ctrl+Alt+End sends Ctrl+Alt+Delete remotely (once per press).\n"
+	       "Shift+right-click a window's taskbar entry for Send Ctrl+Alt+Delete.\n"
 	       "Minimize with Ctrl+Shift+F10; reconnect with Ctrl+Shift+F11; quit with Ctrl+Shift+F12.\n");
 }
 
@@ -459,6 +525,11 @@ static int rdk_main(int argc, wchar_t** argv)
 		if (_wcsicmp(argv[i], L"/latency") == 0)
 		{
 			g_latency = TRUE;
+			continue;
+		}
+		if (_wcsicmp(argv[i], L"/recover") == 0)
+		{
+			g_recover = TRUE;
 			continue;
 		}
 		if (_wcsicmp(argv[i], L"/crash-dump") == 0)
@@ -636,6 +707,12 @@ static int rdk_main(int argc, wchar_t** argv)
 	}
 	for (;;)
 	{
+		if (g_recover && !rdk_recovery_configure(context))
+		{
+			exitReason = "could not configure connection recovery";
+			rc = 1;
+			goto cleanup;
+		}
 		if (power && !rdk_power_arm(power, freerdp_abort_event(context)))
 		{
 			exitReason = "could not arm sleep/resume connection cancellation";
@@ -674,7 +751,7 @@ static int rdk_main(int argc, wchar_t** argv)
 			       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth),
 			       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight));
 			rdk_crash_stage("connected-event-loop");
-			rc = rdk_run(rdk, power);
+			rc = rdk_run_connected(rdk, power);
 		}
 		const BOOL powerInterrupted = rdk_power_interrupted(power);
 		const BOOL powerRecovery = powerInterrupted && !(rdk->quit && !rdk->inputFailed && !rdk->reconnectRequested);
@@ -706,7 +783,7 @@ static int rdk_main(int argc, wchar_t** argv)
 		printf("rdk: shutdown: releasing remote keys\n");
 		fflush(stdout);
 		rdk_crash_stage("releasing-remote-keys");
-		if (!powerInterrupted && freerdp_is_active_state(context) && !rdk_keyboard_release_all(&rdk->keyboard))
+		if (!powerInterrupted && !rdk->recovering && freerdp_is_active_state(context) && !rdk_keyboard_release_all(&rdk->keyboard))
 		{
 			rc = 1;
 			exitReason = "failed to release remote keys during shutdown";
