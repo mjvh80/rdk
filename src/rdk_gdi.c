@@ -264,6 +264,31 @@ static LRESULT CALLBACK rdk_menu_button_proc(HWND button, UINT message, WPARAM w
 {
 	(void)subclass;
 	rdkSessionMenu* menu = (rdkSessionMenu*)user;
+	if (message == WM_GETDLGCODE)
+		return DefSubclassProc(button, message, wParam, lParam) | DLGC_WANTARROWS;
+	if (message == WM_KEYDOWN && (wParam == VK_LEFT || wParam == VK_UP || wParam == VK_RIGHT || wParam == VK_DOWN))
+	{
+		const HWND window = GetParent(button);
+		const size_t count = ARRAYSIZE(rdk_menu_commands);
+		const size_t increment = (wParam == VK_LEFT || wParam == VK_UP) ? count - 1 : 1;
+		for (size_t index = 0; index < count; ++index)
+		{
+			if (GetDlgCtrlID(button) != rdk_menu_commands[index])
+				continue;
+			for (size_t step = 1; step <= count; ++step)
+			{
+				HWND next = GetDlgItem(window, rdk_menu_commands[(index + step * increment) % count]);
+				if (IsWindowEnabled(next) && (GetWindowLongW(next, GWL_STYLE) & WS_VISIBLE))
+				{
+					SetFocus(next);
+					SendMessageW(window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
+					return 0;
+				}
+			}
+			break;
+		}
+		return 0;
+	}
 	if (message == WM_MOUSEMOVE && menu->hovered != (UINT)GetDlgCtrlID(button))
 	{
 		menu->hovered = GetDlgCtrlID(button);
@@ -406,6 +431,21 @@ static INT_PTR CALLBACK rdk_session_menu_proc(HWND window, UINT message, WPARAM 
 	}
 	if (!menu)
 		return FALSE;
+	if (message == DM_GETDEFID)
+	{
+		UINT command = IDCANCEL;
+		const HWND focused = GetFocus();
+		for (size_t index = 0; index < ARRAYSIZE(rdk_menu_commands); ++index)
+		{
+			if (focused == GetDlgItem(window, rdk_menu_commands[index]) && IsWindowEnabled(focused))
+			{
+				command = rdk_menu_commands[index];
+				break;
+			}
+		}
+		SetWindowLongPtrW(window, DWLP_MSGRESULT, MAKELRESULT(command, DC_HASDEFID));
+		return TRUE;
+	}
 	if (message == WM_NCDESTROY)
 	{
 		if (menu->context->sessionMenu == window)

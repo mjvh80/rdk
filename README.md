@@ -169,9 +169,12 @@ reconnect behavior, including `/input` replay. The menu is also available as
 **Session Menu** in the individual window's classic taskbar menu shown with
 Shift+right-click; it is not a group-wide Tasks command.
 
-The menu uses native button controls with Tab/arrow navigation and Enter to
-select, flat system-color drawing, and visible keyboard focus cues.
-**Close menu** (the X) is the default. **Escape**, Close, or switching to another window
+The menu uses native button controls with Tab/arrow navigation, flat system-color
+drawing, and visible keyboard focus cues. Arrow keys cycle through enabled
+commands, and **Enter activates the focused command**. **Close menu** (the X)
+has initial focus and is the fallback if no enabled command is focused.
+**Escape** always dismisses the menu without activating the selected command.
+Close or switching to another window also
 dismisses it. Held remote keys/buttons are released when it opens, remote
 keyboard/mouse forwarding pauses, and startup input waits for focus to return.
 The connection continues processing while the menu is open. There is no hover

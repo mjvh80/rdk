@@ -484,7 +484,12 @@ static int check_session_menu(void)
 	CHECK(GetFocus() == GetDlgItem(client.sessionMenu, IDC_SESSION_MINIMIZE));
 	for (size_t index = 0; index < ARRAYSIZE(rdk_menu_commands); ++index)
 		CHECK((GetWindowLongW(GetDlgItem(client.sessionMenu, rdk_menu_commands[index]), GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW);
-	SetFocus(GetDlgItem(client.sessionMenu, IDCANCEL));
+	navigation.hwnd = GetFocus();
+	navigation.wParam = VK_RETURN;
+	CHECK(IsDialogMessageW(client.sessionMenu, &navigation));
+	CHECK(!client.sessionMenu && IsIconic(client.hwnd) && !client.quit);
+	SendMessageW(client.hwnd, WM_SYSCOMMAND, RDK_SC_SESSION_MENU, 0);
+	CHECK(client.sessionMenu && !IsIconic(client.hwnd));
 	navigation.hwnd = GetDlgItem(client.sessionMenu, IDCANCEL);
 	navigation.wParam = VK_RETURN;
 	CHECK(IsDialogMessageW(client.sessionMenu, &navigation));
@@ -526,6 +531,102 @@ static int check_session_menu(void)
 	CHECK(client.sessionMenu);
 	SendMessageW(client.hwnd, WM_CLOSE, 0, 0);
 	CHECK(!client.sessionMenu && client.quit);
+	DestroyWindow(client.hwnd);
+	return 0;
+}
+
+static int check_menu_enter_navigation(void)
+{
+	const UINT navigationKeys[] = { VK_TAB, VK_RIGHT, VK_LEFT, VK_DOWN, VK_UP };
+	for (size_t route = 0; route < ARRAYSIZE(navigationKeys); ++route)
+	{
+		for (size_t target = 0; target < ARRAYSIZE(rdk_menu_commands); ++target)
+		{
+			rdkContext client = { 0 };
+			client.winW = 800;
+			client.winH = 600;
+			rdk_keyboard_init(&client.keyboard, NULL);
+			client.keyboard.sendScan = record_menu_scan;
+			client.hwnd = rdk_create_window(&client);
+			CHECK(client.hwnd);
+			rdk_capture_init(&client.capture, client.hwnd);
+			ShowWindow(client.hwnd, SW_SHOWNOACTIVATE);
+			rdk_show_session_menu(&client);
+			HWND menu = client.sessionMenu;
+			CHECK(menu);
+			CHECK(GetFocus() == GetDlgItem(menu, IDCANCEL));
+			const int command = rdk_menu_commands[target];
+			HWND selected = GetDlgItem(menu, command);
+			MSG message = { 0 };
+			message.message = WM_KEYDOWN;
+			message.wParam = navigationKeys[route];
+			for (size_t step = 0; GetFocus() != selected && step < ARRAYSIZE(rdk_menu_commands); ++step)
+			{
+				message.hwnd = GetFocus();
+				if (!IsDialogMessageW(menu, &message))
+					DispatchMessageW(&message);
+			}
+			if (GetFocus() != selected)
+				fprintf(stderr, "Navigation key=%u target=%d focused=%d\n", navigationKeys[route], command, GetDlgCtrlID(GetFocus()));
+			CHECK(GetFocus() == selected);
+			CHECK(LOWORD(SendMessageW(menu, DM_GETDEFID, 0, 0)) == command);
+			for (size_t index = 0; index < ARRAYSIZE(rdk_menu_commands); ++index)
+				CHECK((GetWindowLongW(GetDlgItem(menu, rdk_menu_commands[index]), GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW);
+			const UINT scansBefore = menuScanCount;
+			const UINT deletesBefore = menuDeleteCount;
+			message.hwnd = selected;
+			message.wParam = VK_RETURN;
+			CHECK(IsDialogMessageW(menu, &message));
+			CHECK(!client.sessionMenu && !IsWindow(menu));
+			CHECK(IsIconic(client.hwnd) == (command == IDC_SESSION_MINIMIZE));
+			CHECK(client.quit == (command == IDC_SESSION_RECONNECT || command == IDC_SESSION_DISCONNECT));
+			CHECK(client.reconnectRequested == (command == IDC_SESSION_RECONNECT));
+			CHECK(menuScanCount - scansBefore == (command == IDC_SESSION_SECURITY ? 6u : 0u));
+			CHECK(menuDeleteCount - deletesBefore == (command == IDC_SESSION_SECURITY ? 2u : 0u));
+			CHECK(!client.inputFailed);
+			DestroyWindow(client.hwnd);
+		}
+	}
+	rdkContext client = { 0 };
+	client.winW = 800;
+	client.winH = 600;
+	rdk_keyboard_init(&client.keyboard, NULL);
+	client.keyboard.sendScan = record_menu_scan;
+	client.hwnd = rdk_create_window(&client);
+	CHECK(client.hwnd);
+	rdk_capture_init(&client.capture, client.hwnd);
+	ShowWindow(client.hwnd, SW_SHOWNOACTIVATE);
+	rdk_show_session_menu(&client);
+	CHECK(client.sessionMenu);
+	HWND reconnect = GetDlgItem(client.sessionMenu, IDC_SESSION_RECONNECT);
+	SetFocus(reconnect);
+	CHECK(LOWORD(SendMessageW(client.sessionMenu, DM_GETDEFID, 0, 0)) == IDC_SESSION_RECONNECT);
+	EnableWindow(reconnect, FALSE);
+	CHECK(LOWORD(SendMessageW(client.sessionMenu, DM_GETDEFID, 0, 0)) == IDCANCEL);
+	SetFocus(GetDlgItem(client.sessionMenu, IDC_SESSION_SECURITY));
+	MSG arrow = { 0 };
+	arrow.hwnd = GetFocus();
+	arrow.message = WM_KEYDOWN;
+	arrow.wParam = VK_RIGHT;
+	if (!IsDialogMessageW(client.sessionMenu, &arrow))
+		DispatchMessageW(&arrow);
+	CHECK(GetFocus() == GetDlgItem(client.sessionMenu, IDC_SESSION_DISCONNECT));
+	arrow.hwnd = GetFocus();
+	arrow.wParam = VK_LEFT;
+	if (!IsDialogMessageW(client.sessionMenu, &arrow))
+		DispatchMessageW(&arrow);
+	CHECK(GetFocus() == GetDlgItem(client.sessionMenu, IDC_SESSION_SECURITY));
+	SetFocus(NULL);
+	CHECK(!GetFocus());
+	CHECK(LOWORD(SendMessageW(client.sessionMenu, DM_GETDEFID, 0, 0)) == IDCANCEL);
+	EnableWindow(reconnect, TRUE);
+	SetFocus(reconnect);
+	MSG escape = { 0 };
+	escape.hwnd = reconnect;
+	escape.message = WM_KEYDOWN;
+	escape.wParam = VK_ESCAPE;
+	CHECK(IsDialogMessageW(client.sessionMenu, &escape));
+	CHECK(!client.sessionMenu && !client.quit && !client.reconnectRequested);
 	DestroyWindow(client.hwnd);
 	return 0;
 }
@@ -573,6 +674,7 @@ int main(int argc, char** argv)
 	CHECK(desktop && SetThreadDesktop(desktop));
 	CHECK(check_security_menu() == 0);
 	CHECK(check_session_menu() == 0);
+	CHECK(check_menu_enter_navigation() == 0);
 	rdkContext rdk = { 0 };
 	rdk.winX = 20;
 	rdk.winY = 30;
