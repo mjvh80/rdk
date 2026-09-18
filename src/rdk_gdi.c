@@ -17,6 +17,7 @@
 #include "rdk_latency.h"
 
 #include <stdio.h>
+#include <commctrl.h>
 #include <dbt.h>
 #include <string.h> /* strcmp */
 #include <windowsx.h> /* GET_X_LPARAM / GET_Y_LPARAM / GET_WHEEL_DELTA_WPARAM */
@@ -31,6 +32,10 @@
 static const wchar_t* const RDK_WINDOW_CLASS = L"rdkWindowClass";
 static const UINT_PTR RDK_LOCK_TIMER = 1;
 static const UINT RDK_SC_CTRL_ALT_DELETE = 0x1000;
+static const UINT RDK_SC_SESSION_MENU = 0x1010;
+
+static void rdk_show_session_menu(rdkContext* rdk);
+static void rdk_close_session_menu(rdkContext* rdk, BOOL restoreFocus);
 
 /* ---- rendering + input ------------------------------------------------- */
 
@@ -84,7 +89,7 @@ static BOOL rdk_set_keyboard_indicators(rdpContext* context, UINT16 flags)
 
 static void rdk_on_key(rdkContext* rdk, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	if (!rdk->focused || rdk->quit)
+	if (!rdk->focused || rdk->quit || rdk->sessionMenu)
 		return;
 	if (wParam == VK_NUMLOCK || wParam == VK_CAPITAL)
 		rdk_cancel_lock_sync(rdk);
@@ -107,6 +112,12 @@ static void rdk_on_key(rdkContext* rdk, UINT msg, WPARAM wParam, LPARAM lParam)
 			fflush(stdout);
 			SendMessageW(rdk->hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
 		}
+	}
+	if (rdk->keyboard.menu)
+	{
+		rdk->keyboard.menu = FALSE;
+		if (!rdk->quit)
+			rdk_show_session_menu(rdk);
 	}
 }
 
@@ -146,7 +157,7 @@ static void rdk_send_focus_in(rdkContext* rdk)
 static void rdk_on_mouse(rdkContext* rdk, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	rdpInput* input = ((rdpContext*)rdk)->input;
-	if (rdk->quit || rdk->recovering)
+	if (rdk->quit || rdk->recovering || rdk->sessionMenu)
 		return;
 	if (msg != WM_MOUSEMOVE)
 	{
@@ -236,6 +247,281 @@ static void rdk_focus_out(rdkContext* rdk)
 		ReleaseCapture();
 }
 
+typedef struct
+{
+	rdkContext* context;
+	HFONT font;
+	HFONT symbols;
+	HWND tooltip;
+	UINT hovered;
+} rdkSessionMenu;
+
+static const int rdk_menu_commands[] = { IDC_SESSION_MINIMIZE, IDC_SESSION_SECURITY,
+	IDC_SESSION_RECONNECT, IDC_SESSION_DISCONNECT, IDCANCEL };
+
+static LRESULT CALLBACK rdk_menu_button_proc(HWND button, UINT message, WPARAM wParam, LPARAM lParam,
+                                            UINT_PTR subclass, DWORD_PTR user)
+{
+	(void)subclass;
+	rdkSessionMenu* menu = (rdkSessionMenu*)user;
+	if (message == WM_MOUSEMOVE && menu->hovered != (UINT)GetDlgCtrlID(button))
+	{
+		menu->hovered = GetDlgCtrlID(button);
+		TRACKMOUSEEVENT tracking = { sizeof(tracking), TME_LEAVE, button, 0 };
+		TrackMouseEvent(&tracking);
+		InvalidateRect(button, NULL, FALSE);
+	}
+	else if (message == WM_MOUSELEAVE)
+	{
+		if (menu->hovered == (UINT)GetDlgCtrlID(button))
+			menu->hovered = 0;
+		InvalidateRect(button, NULL, FALSE);
+	}
+	return DefSubclassProc(button, message, wParam, lParam);
+}
+
+static void rdk_layout_session_menu(HWND window, const RECT* area, UINT dpi)
+{
+	rdkSessionMenu* menu = (rdkSessionMenu*)GetWindowLongPtrW(window, DWLP_USER);
+	const int padding = MulDiv(10, dpi, 96);
+	const int gap = MulDiv(4, dpi, 96);
+	const int height = MulDiv(34, dpi, 96);
+	const int iconSize = MulDiv(24, dpi, 96);
+	const int start = padding + iconSize + padding;
+	const int widths[] = { 34, 144, 104, 108, 34 };
+	const int width = min(MulDiv(510, dpi, 96), area->right - area->left - 2 * padding);
+	HFONT font = CreateFontW(-MulDiv(14, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+	    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+	HFONT symbols = CreateFontW(-MulDiv(12, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+	    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
+	if (menu->font) DeleteObject(menu->font);
+	if (menu->symbols) DeleteObject(menu->symbols);
+	menu->font = font;
+	menu->symbols = symbols;
+	int left = start;
+	int top = padding;
+	for (size_t index = 0; index < ARRAYSIZE(rdk_menu_commands); ++index)
+	{
+		const int buttonWidth = MulDiv(widths[index], dpi, 96);
+		if (left > start && left + buttonWidth > width - padding)
+		{
+			left = start;
+			top += height + gap;
+		}
+		HWND button = GetDlgItem(window, rdk_menu_commands[index]);
+		SetWindowPos(button, NULL, left, top, buttonWidth, height, SWP_NOZORDER | SWP_NOACTIVATE);
+		SendMessageW(button, WM_SETFONT, (WPARAM)font, FALSE);
+		left += buttonWidth + gap;
+	}
+	HWND icon = GetDlgItem(window, IDC_SESSION_ICON);
+	SetWindowPos(icon, NULL, padding, padding + (height - iconSize) / 2, iconSize, iconSize,
+	    SWP_NOZORDER | SWP_NOACTIVATE);
+	SendMessageW(icon, STM_SETICON, (WPARAM)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_RDK),
+	    IMAGE_ICON, iconSize, iconSize, LR_SHARED), 0);
+	RECT outer = { 0, 0, width, top + height + padding };
+	AdjustWindowRectExForDpi(&outer, GetWindowLongW(window, GWL_STYLE), FALSE,
+	    GetWindowLongW(window, GWL_EXSTYLE), dpi);
+	const int outerWidth = outer.right - outer.left;
+	SetWindowPos(window, NULL, area->left + (area->right - area->left - outerWidth) / 2,
+	    area->top + padding, outerWidth, outer.bottom - outer.top, SWP_NOZORDER | SWP_NOACTIVATE);
+	InvalidateRect(window, NULL, TRUE);
+}
+
+static BOOL rdk_draw_menu_button(rdkSessionMenu* menu, const DRAWITEMSTRUCT* item)
+{
+	const BOOL selected = (item->itemState & ODS_SELECTED) != 0;
+	const BOOL hot = menu->hovered == item->CtlID;
+	const BOOL disabled = (item->itemState & ODS_DISABLED) != 0;
+	const int background = selected ? COLOR_HIGHLIGHT : hot ? COLOR_3DFACE : COLOR_WINDOW;
+	FillRect(item->hDC, &item->rcItem, GetSysColorBrush(background));
+	SetBkMode(item->hDC, TRANSPARENT);
+	SetTextColor(item->hDC, GetSysColor(disabled ? COLOR_GRAYTEXT : selected ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+	const BOOL symbol = item->CtlID == IDCANCEL || item->CtlID == IDC_SESSION_MINIMIZE;
+	HGDIOBJ previous = SelectObject(item->hDC, symbol ? menu->symbols : menu->font);
+	WCHAR text[80];
+	GetWindowTextW(item->hwndItem, text, ARRAYSIZE(text));
+	RECT bounds = item->rcItem;
+	DrawTextW(item->hDC, symbol ? (item->CtlID == IDCANCEL ? L"\xE8BB" : L"\xE921") : text, -1,
+	    &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	SelectObject(item->hDC, previous);
+	if ((item->itemState & ODS_FOCUS) && !(item->itemState & ODS_NOFOCUSRECT))
+	{
+		InflateRect(&bounds, -3, -3);
+		DrawFocusRect(item->hDC, &bounds);
+	}
+	return TRUE;
+}
+
+static void rdk_close_session_menu(rdkContext* rdk, BOOL restoreFocus)
+{
+	HWND menu = rdk->sessionMenu;
+	if (!menu)
+		return;
+	const HWND foreground = GetForegroundWindow();
+	const BOOL restore = restoreFocus && !rdk->quit && !rdk->recovering &&
+	                     !IsIconic(rdk->hwnd) && (foreground == menu || foreground == rdk->hwnd);
+	rdk->sessionMenu = NULL;
+	DestroyWindow(menu);
+	if (restore)
+	{
+		SetActiveWindow(rdk->hwnd);
+		SetFocus(rdk->hwnd);
+	}
+}
+
+static INT_PTR CALLBACK rdk_session_menu_proc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	rdkSessionMenu* menu = (rdkSessionMenu*)GetWindowLongPtrW(window, DWLP_USER);
+	if (message == WM_INITDIALOG)
+	{
+		menu = calloc(1, sizeof(*menu));
+		if (!menu)
+		{
+			DestroyWindow(window);
+			return FALSE;
+		}
+		menu->context = (rdkContext*)lParam;
+		SetWindowLongPtrW(window, DWLP_USER, (LONG_PTR)menu);
+		rdkContext* rdk = menu->context;
+		rdk->sessionMenu = window;
+		SetWindowTextW(window, L"rdk - Session Menu");
+		rdk_window_icons(window);
+		menu->tooltip = CreateWindowExW(WS_EX_TRANSPARENT, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP,
+		    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window, NULL, GetModuleHandleW(NULL), NULL);
+		for (size_t index = 0; index < ARRAYSIZE(rdk_menu_commands); ++index)
+		{
+			HWND button = GetDlgItem(window, rdk_menu_commands[index]);
+			SetWindowSubclass(button, rdk_menu_button_proc, 1, (DWORD_PTR)menu);
+			TOOLINFOW tool = { sizeof(tool) };
+			tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+			tool.hwnd = window;
+			tool.uId = (UINT_PTR)button;
+			const WCHAR* labels[] = { L"Minimize", L"Send Ctrl+Alt+Delete", L"Reconnect", L"Disconnect", L"Close menu (Escape)" };
+			tool.lpszText = (WCHAR*)labels[index];
+			SendMessageW(menu->tooltip, TTM_ADDTOOLW, 0, (LPARAM)&tool);
+		}
+		SendMessageW(window, DM_SETDEFID, IDCANCEL, 0);
+		SetFocus(GetDlgItem(window, IDCANCEL));
+		return FALSE;
+	}
+	if (!menu)
+		return FALSE;
+	if (message == WM_NCDESTROY)
+	{
+		if (menu->context->sessionMenu == window)
+			menu->context->sessionMenu = NULL;
+		if (menu->font) DeleteObject(menu->font);
+		if (menu->symbols) DeleteObject(menu->symbols);
+		free(menu);
+		SetWindowLongPtrW(window, DWLP_USER, 0);
+		return FALSE;
+	}
+	if (message == WM_ERASEBKGND)
+	{
+		RECT bounds;
+		GetClientRect(window, &bounds);
+		FillRect((HDC)wParam, &bounds, GetSysColorBrush(COLOR_WINDOW));
+		return TRUE;
+	}
+	if (message == WM_CTLCOLORSTATIC)
+	{
+		SetBkColor((HDC)wParam, GetSysColor(COLOR_WINDOW));
+		return (INT_PTR)GetSysColorBrush(COLOR_WINDOW);
+	}
+	if (message == WM_DRAWITEM)
+		return rdk_draw_menu_button(menu, (const DRAWITEMSTRUCT*)lParam);
+	if (message == WM_DPICHANGED)
+	{
+		RECT area;
+		GetWindowRect(menu->context->hwnd, &area);
+		MONITORINFO monitor = { sizeof(monitor) };
+		if (GetMonitorInfoW(MonitorFromRect((const RECT*)lParam, MONITOR_DEFAULTTONEAREST), &monitor))
+			IntersectRect(&area, &area, &monitor.rcWork);
+		rdk_layout_session_menu(window, &area, HIWORD(wParam));
+		return TRUE;
+	}
+	rdkContext* rdk = menu->context;
+	if (rdk->sessionMenu != window)
+		return FALSE;
+	if (message == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)
+	{
+		rdk_close_session_menu(rdk, (HWND)lParam == rdk->hwnd);
+		return TRUE;
+	}
+	if (message == WM_CLOSE)
+	{
+		rdk_close_session_menu(rdk, TRUE);
+		return TRUE;
+	}
+	if (message == WM_COMMAND && HIWORD(wParam) == BN_CLICKED)
+	{
+		const UINT command = LOWORD(wParam);
+		if (command != IDCANCEL && command != IDC_SESSION_MINIMIZE && command != IDC_SESSION_SECURITY &&
+		    command != IDC_SESSION_RECONNECT && command != IDC_SESSION_DISCONNECT)
+			return FALSE;
+		if (rdk->quit || rdk->recovering || rdk->inputFailed)
+		{
+			rdk_close_session_menu(rdk, FALSE);
+			return TRUE;
+		}
+		if (command == IDC_SESSION_RECONNECT || command == IDC_SESSION_DISCONNECT)
+		{
+			rdk->reconnectRequested = command == IDC_SESSION_RECONNECT;
+			rdk->stopReason = rdk->reconnectRequested ? "session menu reconnect requested" : "session menu disconnect requested";
+			rdk->quit = TRUE;
+		}
+		if (command == IDC_SESSION_SECURITY)
+			rdk_input_result(rdk, rdk_keyboard_ctrl_alt_delete(&rdk->keyboard));
+		rdk_close_session_menu(rdk, command == IDCANCEL || command == IDC_SESSION_SECURITY);
+		if (command == IDC_SESSION_MINIMIZE)
+			SendMessageW(rdk->hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static void rdk_show_session_menu(rdkContext* rdk)
+{
+	if (rdk->quit || rdk->inputFailed || rdk->recovering)
+		return;
+	if (rdk->sessionMenu)
+	{
+		SetActiveWindow(rdk->sessionMenu);
+		return;
+	}
+	if (IsIconic(rdk->hwnd))
+		ShowWindow(rdk->hwnd, SW_RESTORE);
+	rdk_focus_out(rdk);
+	if (rdk->quit)
+		return;
+	HWND menu = CreateDialogParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_SESSION_MENU),
+	                              rdk->hwnd, rdk_session_menu_proc, (LPARAM)rdk);
+	if (menu && IsWindow(menu))
+	{
+		POINT position;
+		RECT owner;
+		GetWindowRect(rdk->hwnd, &owner);
+		if (!GetCursorPos(&position) || !PtInRect(&owner, position))
+			position = (POINT){ owner.left, owner.top };
+		MONITORINFO monitor = { sizeof(monitor) };
+		RECT area = owner;
+		if (GetMonitorInfoW(MonitorFromPoint(position, MONITOR_DEFAULTTONEAREST), &monitor))
+		{
+			IntersectRect(&area, &owner, &monitor.rcWork);
+		}
+		rdk_layout_session_menu(menu, &area, GetDpiForWindow(menu));
+		ShowWindow(menu, SW_SHOW);
+		SetActiveWindow(menu);
+		SetFocus(GetDlgItem(menu, IDCANCEL));
+	}
+	else
+	{
+		fprintf(stderr, "rdk: could not open session menu (%lu)\n", GetLastError());
+		if (GetForegroundWindow() == rdk->hwnd && GetFocus() == rdk->hwnd)
+			SendMessageW(rdk->hwnd, WM_SETFOCUS, 0, 0);
+	}
+}
+
 static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	rdkContext* rdk = (rdkContext*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -243,10 +529,18 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 	switch (msg)
 	{
 		case WM_INITMENUPOPUP:
+			EnableMenuItem(GetSystemMenu(hwnd, FALSE), RDK_SC_SESSION_MENU,
+			    MF_BYCOMMAND | ((rdk && !rdk->quit && !rdk->inputFailed && !rdk->recovering) ? MF_ENABLED : MF_GRAYED));
 			EnableMenuItem(GetSystemMenu(hwnd, FALSE), RDK_SC_CTRL_ALT_DELETE,
 			    MF_BYCOMMAND | ((rdk && !rdk->quit && !rdk->inputFailed && !rdk->recovering) ? MF_ENABLED : MF_GRAYED));
 			return DefWindowProcW(hwnd, msg, wParam, lParam);
 		case WM_SYSCOMMAND:
+			if ((wParam & 0xFFF0) == RDK_SC_SESSION_MENU)
+			{
+				if (rdk)
+					rdk_show_session_menu(rdk);
+				return 0;
+			}
 			if ((wParam & 0xFFF0) == RDK_SC_CTRL_ALT_DELETE)
 			{
 				if (rdk && !rdk->quit && !rdk->inputFailed && !rdk->recovering)
@@ -315,7 +609,7 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			return 0;
 		}
 		case WM_SETFOCUS:
-			if (rdk && !rdk->recovering && !IsIconic(hwnd))
+			if (rdk && !rdk->recovering && !rdk->sessionMenu && !IsIconic(hwnd))
 			{
 				rdk->focused = TRUE;
 				rdk_capture_set_active(&rdk->capture, TRUE);
@@ -331,7 +625,11 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			return 0;
 		case WM_SIZE:
 			if (wParam == SIZE_MINIMIZED)
+			{
+				if (rdk)
+					rdk_close_session_menu(rdk, FALSE);
 				rdk_focus_out(rdk);
+			}
 			return DefWindowProcW(hwnd, msg, wParam, lParam);
 		case WM_CAPTURECHANGED:
 			if (rdk)
@@ -376,6 +674,7 @@ static LRESULT CALLBACK rdk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 			{
 				rdk->stopReason = "window close requested";
 				rdk->quit = TRUE;
+				rdk_close_session_menu(rdk, FALSE);
 			}
 			return 0;
 		default:
@@ -545,7 +844,7 @@ static HWND rdk_create_window(rdkContext* rdk)
 	wc.lpszClassName = RDK_WINDOW_CLASS;
 	RegisterClassExW(&wc); /* harmless if already registered */
 
-	HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_APPWINDOW, RDK_WINDOW_CLASS, L"rdk",
+	HWND window = CreateWindowExW(WS_EX_APPWINDOW, RDK_WINDOW_CLASS, L"rdk",
 	    WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX, rdk->winX, rdk->winY, rdk->winW, rdk->winH,
 	    NULL, NULL, wc.hInstance, rdk);
 	if (!window)
@@ -553,7 +852,8 @@ static HWND rdk_create_window(rdkContext* rdk)
 	HMENU menu = GetSystemMenu(window, FALSE);
 	if (!menu || !InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, RDK_SC_CTRL_ALT_DELETE,
 	                         L"Send Ctrl+Alt+Delete\tCtrl+Alt+End") ||
-	    !InsertMenuW(menu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL))
+	    !InsertMenuW(menu, 1, MF_BYPOSITION | MF_STRING, RDK_SC_SESSION_MENU, L"Session &Menu\tCtrl+Shift+F9") ||
+	    !InsertMenuW(menu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, NULL))
 	{
 		DestroyWindow(window);
 		return NULL;
@@ -659,6 +959,7 @@ BOOL rdk_gdi_recovery(rdkContext* rdk, BOOL active)
 	rdk->recovering = active;
 	if (active)
 	{
+		rdk_close_session_menu(rdk, FALSE);
 		rdk_cancel_lock_sync(rdk);
 		rdk->focused = FALSE;
 		rdk_capture_set_active(&rdk->capture, FALSE);
@@ -688,6 +989,7 @@ void rdk_gdi_post_disconnect(freerdp* instance)
 
 	printf("rdk: shutdown: cleaning up local session\n");
 	fflush(stdout);
+	rdk_close_session_menu(rdk, FALSE);
 	rdk_clipboard_free(rdk->clipboard);
 	rdk->clipboard = NULL;
 	rdk_cancel_lock_sync(rdk);

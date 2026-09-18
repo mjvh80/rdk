@@ -65,9 +65,10 @@ execute_process(COMMAND "${RDK_EXE}" --startup-delay 0 --char-delay 4294967295 /
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "Valid delay boundaries: result=${result}, ${output}${error}")
 endif()
-if(NOT output MATCHES "Ctrl[+]Shift[+]F10" OR NOT output MATCHES "Ctrl[+]Shift[+]F11" OR
+if(NOT output MATCHES "Ctrl[+]Shift[+]F9 opens the session menu" OR
+    NOT output MATCHES "Ctrl[+]Shift[+]F10" OR NOT output MATCHES "Ctrl[+]Shift[+]F11" OR
    NOT output MATCHES "Ctrl[+]Shift[+]F12")
-    message(FATAL_ERROR "Help must list local minimize, reconnect, and quit shortcuts: ${output}")
+     message(FATAL_ERROR "Help must list local menu, minimize, reconnect, and quit shortcuts: ${output}")
 endif()
 if(NOT output MATCHES "Ctrl[+]Alt[+]End sends Ctrl[+]Alt[+]Delete remotely" OR
    NOT output MATCHES "Shift[+]right-click a window's taskbar entry for Send Ctrl[+]Alt[+]Delete")

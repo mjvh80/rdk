@@ -298,6 +298,30 @@ static BOOL alt_tab_and_exit(void)
 	return TRUE;
 }
 
+static BOOL session_menu_shortcut(void)
+{
+	CHECK(key(VK_LCONTROL, RDP_SCANCODE_LCONTROL, TRUE, 0));
+	CHECK(key(VK_RSHIFT, RDP_SCANCODE_RSHIFT, TRUE, 0));
+	CHECK(key(VK_F9, RDP_SCANCODE_F9, TRUE, 0));
+	CHECK(key(VK_F9, RDP_SCANCODE_F9, TRUE, 0));
+	CHECK(drain());
+	CHECK(keyboard.menu && !keyboard.quit && sentCount == 4);
+	for (size_t index = 0; index < sentCount; ++index)
+		CHECK(sent[index].code != RDP_SCANCODE_F9);
+	rdk_capture_set_active(&capture, FALSE);
+	CHECK(!key(VK_DOWN, RDP_SCANCODE_DOWN, TRUE, 0));
+	CHECK(!key(VK_ESCAPE, RDP_SCANCODE_ESCAPE, TRUE, 0));
+	CHECK(messageCount == 0);
+	keyboard.menu = FALSE;
+	CHECK(rdk_keyboard_release_all(&keyboard));
+	rdk_capture_set_active(&capture, TRUE);
+	CHECK(key('A', RDP_SCANCODE_KEY_A, TRUE, 0));
+	CHECK(key('A', RDP_SCANCODE_KEY_A, FALSE, 0));
+	CHECK(drain());
+	CHECK(sentCount == 6);
+	return TRUE;
+}
+
 static BOOL ctrl_alt_end(void)
 {
 	CHECK(key(VK_LCONTROL, RDP_SCANCODE_LCONTROL, TRUE, 0));
@@ -389,7 +413,7 @@ int main(void)
 {
 	BOOL (*tests[])(void) = { windows_run, lock_passthrough, only_foreground, focus_generation,
 		alt_tab_and_exit, ctrl_alt_end, injected_alt_codes, zero_scan_and_repeats, queue_failure,
-		remote_lock_indicators, inactive_hook_lifecycle };
+		remote_lock_indicators, session_menu_shortcut, inactive_hook_lifecycle };
 	for (UINT mode = 0; mode < 2; ++mode)
 	{
 		if (!rdk_latency_enable(mode != 0))

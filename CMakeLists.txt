@@ -140,7 +140,7 @@ if(BUILD_TESTING)
 	add_dependencies(rdk_window_test rdk-taskbar)
 	target_include_directories(rdk_window_test PRIVATE src assets)
 	target_link_libraries(rdk_window_test PRIVATE rdk_camera rdk_clipboard rdk_taskbar rdk_latency freerdp freerdp-client
-		winpr user32 gdi32 ws2_32 ole32 uuid winmm)
+		winpr user32 gdi32 ws2_32 ole32 uuid winmm comctl32)
 	target_compile_definitions(rdk_window_test PRIVATE UNICODE _UNICODE)
 	add_test(NAME window COMMAND rdk_window_test)
 	set_tests_properties(window PROPERTIES TIMEOUT 15)

@@ -264,7 +264,8 @@ static int rdk_run(rdkContext* rdk, rdkPower* power, BOOL replayStartup)
 				rdk->quit = TRUE;
 				break;
 			}
-			if (!rdk->notice || !IsDialogMessageW(rdk->notice, &msg))
+			if ((!rdk->sessionMenu || !IsDialogMessageW(rdk->sessionMenu, &msg)) &&
+			    (!rdk->notice || !IsDialogMessageW(rdk->notice, &msg)))
 				DispatchMessageW(&msg);
 			if (rdk->quit)
 				break;
@@ -478,6 +479,7 @@ static void rdk_usage(void)
 	       "Certificates are auto-accepted for this proof of concept.\n"
 	       "Ctrl+Alt+End sends Ctrl+Alt+Delete remotely (once per press).\n"
 	       "Shift+right-click a window's taskbar entry for Send Ctrl+Alt+Delete.\n"
+	       "Ctrl+Shift+F9 opens the session menu; Escape closes it.\n"
 	       "Minimize with Ctrl+Shift+F10; reconnect with Ctrl+Shift+F11; quit with Ctrl+Shift+F12.\n");
 }
 
@@ -746,7 +748,7 @@ static int rdk_main(int argc, wchar_t** argv)
 		if (connected)
 		{
 			(void)rdk_credentials_save(&credentials);
-			printf("rdk: connected on %u monitor(s), %ux%u. Ctrl+Shift+F10 to minimize; Ctrl+Shift+F11 to reconnect; Ctrl+Shift+F12 to quit.\n",
+			printf("rdk: connected on %u monitor(s), %ux%u. Ctrl+Shift+F9 for session menu; Ctrl+Shift+F10 to minimize; Ctrl+Shift+F11 to reconnect; Ctrl+Shift+F12 to quit.\n",
 			       freerdp_settings_get_uint32(context->settings, FreeRDP_MonitorCount),
 			       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth),
 			       freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight));

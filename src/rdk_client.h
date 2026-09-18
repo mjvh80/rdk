@@ -29,6 +29,7 @@ typedef struct
 
 	HWND hwnd;         /* fullscreen window spanning the selected displays */
 	HWND notice;
+	HWND sessionMenu;
 	rdkMediaWatch* mediaWatch;
 	rdkClipboard* clipboard;
 	BOOL reconnectRequested;

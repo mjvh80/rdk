@@ -39,6 +39,7 @@ typedef struct
 	BOOL quit;
 	BOOL reconnect;
 	BOOL minimize;
+	BOOL menu;
 } rdkKeyboard;
 
 BOOL rdk_keyboard_configure(rdpSettings* settings);

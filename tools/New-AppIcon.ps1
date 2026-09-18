@@ -10,15 +10,19 @@ $frames = foreach ($size in @(16, 20, 24, 32, 40, 48, 60, 64, 80, 96, 128, 256))
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $graphics.ScaleTransform($size / 64.0, $size / 64.0)
-    $background = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#087F82'))
-    $ink = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::White)
-    $accent = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#F5C85B'))
-    $outline = [System.Drawing.Pen]::new([System.Drawing.Color]::White, 4)
-    $graphics.FillRectangle($background, 3, 3, 58, 58)
-    $graphics.DrawRectangle($outline, 12, 17, 35, 25)
-    $graphics.FillRectangle($ink, 26, 43, 7, 7)
-    $graphics.FillRectangle($ink, 19, 50, 21, 4)
-    $graphics.FillRectangle($background, 32, 8, 23, 23)
+    $ink = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#2563EB'))
+    $accent = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#FFE14D'))
+    $outline = [System.Drawing.Pen]::new($ink.Color, 5)
+    $arrowOutline = [System.Drawing.Pen]::new($ink.Color, 1.5)
+    $arrowOutline.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+    $graphics.Clear([System.Drawing.Color]::Transparent)
+    $graphics.DrawRectangle($outline, 8, 19, 41, 28)
+    $graphics.FillRectangle($ink, 25, 48, 7, 6)
+    $graphics.FillRectangle($ink, 16, 54, 25, 4)
+    $clear = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::Transparent)
+    $graphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+    $graphics.FillRectangle($clear, 32, 7, 25, 27)
+    $graphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceOver
     $arrow = [System.Drawing.PointF[]]@(
         [System.Drawing.PointF]::new(36, 10), [System.Drawing.PointF]::new(54, 10),
         [System.Drawing.PointF]::new(54, 28), [System.Drawing.PointF]::new(48, 28),
@@ -27,6 +31,7 @@ $frames = foreach ($size in @(16, 20, 24, 32, 40, 48, 60, 64, 80, 96, 128, 256))
         [System.Drawing.PointF]::new(36, 16)
     )
     $graphics.FillPolygon($accent, $arrow)
+    $graphics.DrawPolygon($arrowOutline, $arrow)
     $stream = [System.IO.MemoryStream]::new()
     $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
     if ($size -eq 256) {
@@ -36,9 +41,10 @@ $frames = foreach ($size in @(16, 20, 24, 32, 40, 48, 60, 64, 80, 96, 128, 256))
     [PSCustomObject]@{ Size = $size; Bytes = $stream.ToArray() }
     $stream.Dispose()
     $outline.Dispose()
+    $arrowOutline.Dispose()
+    $clear.Dispose()
     $accent.Dispose()
     $ink.Dispose()
-    $background.Dispose()
     $graphics.Dispose()
     $bitmap.Dispose()
 }

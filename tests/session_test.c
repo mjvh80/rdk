@@ -30,7 +30,10 @@ static int icon_check(HICON icon, int size)
 	size_t opaque = 0;
 	for (size_t index = 0; index < (size_t)size * size; ++index)
 		if (pixels[index * 4 + 3] > 127) ++opaque;
-	CHECK(opaque * 100 > (size_t)size * size * 70);
+	CHECK(opaque * 100 > (size_t)size * size * 20);
+	CHECK(opaque * 100 < (size_t)size * size * 55);
+	CHECK(pixels[3] == 0);
+	CHECK(pixels[((size_t)(size / 2) * size + size / 4) * 4 + 3] == 0);
 	ReleaseDC(NULL, screen);
 	free(pixels);
 	DeleteObject(info.hbmColor);

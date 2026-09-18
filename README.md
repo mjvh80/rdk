@@ -140,7 +140,8 @@ authentication failure, not certificate rejection. `/cert:ignore` does not
 fix it. Explicit credentials can help when passwordless SSO is unavailable;
 server/domain policy can still reject authentication.
 
-Minimize while staying connected with Ctrl+Shift+F10. Quit with Ctrl+Shift+F12.
+Open the session menu with Ctrl+Shift+F9. Minimize while staying connected with
+Ctrl+Shift+F10. Quit with Ctrl+Shift+F12.
 Reconnect with Ctrl+Shift+F11 using the same credentials and options; `/input`
 replays with its delays. These shortcuts work
 while the remote desktop window has keyboard focus. Startup text is sent once, incrementally, while the
@@ -148,8 +149,36 @@ client is focused and no keyboard key is held. CRLF is one Enter; Tab and
 Backspace use scancodes. Supplementary Unicode characters use surrogate pairs.
 Invalid, negative, and overflowing delay values are rejected.
 Win+R, the Windows key, and Alt+Tab are forwarded to the remote desktop while
-rdk has foreground keyboard focus. Minimize, reconnect, and quit shortcuts remain
-local; F10 and F11 without both Ctrl and Shift are forwarded normally.
+rdk has foreground keyboard focus. Menu, minimize, reconnect, and quit shortcuts
+remain local; F9, F10 and F11 without both Ctrl and Shift are forwarded normally.
+
+rdk remains borderless fullscreen but is no longer always on top. Local windows
+can appear above it without minimizing or disconnecting rdk. Keyboard capture
+still requires rdk to be foreground and focused; activating it again restores
+remote input. Fullscreen sizing and the selected monitors are unchanged.
+
+**Ctrl+Shift+F9** opens an on-demand **Session Menu** as a compact command strip
+near the top center of the rdk window's visible area on the monitor containing
+the pointer (or the first part of the rdk window if the pointer is elsewhere).
+The strip has no title bar, uses equal-height controls, and wraps at narrow
+widths. Minimize and Close use familiar symbols with hover tooltips.
+It offers **Minimize**, **Send Ctrl+Alt+Delete**, **Reconnect**, and **Disconnect**,
+all for that session only. Disconnect closes the client connection without
+signing out the remote account. Reconnect retains the existing explicit
+reconnect behavior, including `/input` replay. The menu is also available as
+**Session Menu** in the individual window's classic taskbar menu shown with
+Shift+right-click; it is not a group-wide Tasks command.
+
+The menu uses native button controls with Tab/arrow navigation and Enter to
+select, flat system-color drawing, and visible keyboard focus cues.
+**Close menu** (the X) is the default. **Escape**, Close, or switching to another window
+dismisses it. Held remote keys/buttons are released when it opens, remote
+keyboard/mouse forwarding pauses, and startup input waits for focus to return.
+The connection continues processing while the menu is open. There is no hover
+activation or permanent overlay: the top strip appears only when requested.
+Ordinary right-click and
+Alt+Tab remain remote when rdk itself is focused; no windowed mode or local-input
+toggle is introduced by this change.
 
 Press **Ctrl+Alt+End** while rdk is focused to send **Ctrl+Alt+Delete** to the
 remote session. Hold Ctrl and Alt before pressing the dedicated End key;
@@ -190,8 +219,10 @@ to update its task entries. Registration success/errors are logged; if the helpe
 is missing or shell policy prevents jump lists, Ctrl+Shift+F10/F11 remain available,
 as does Minimize in the classic window menu.
 
-The executable includes a multi-resolution taskbar icon (16-256 pixels), with
-window icons sized for display scaling. The device-change notice uses themed
+The executable includes a multi-resolution taskbar icon (16-256 pixels): a blue
+monitor and yellow connection arrow with a transparent background and screen
+interior, rather than a solid square. Window icons are sized for display scaling.
+The device-change notice uses themed
 Windows controls, Segoe UI text, and a DPI-aware layout. Later remains the default
 action, and appearing notices do not take focus. The icon can be regenerated
 with `./tools/New-AppIcon.ps1`.
@@ -654,6 +685,17 @@ inactive; no real keyboard input is recorded or injected by these tests.
 Live verification still requires pressing both locks while focused on rdk,
 checking the keyboard LEDs and remote typing, then switching to a local app
 and back. Also check remote on-screen keyboard toggles while rdk is focused.
+Session-menu tests check both Ctrl/Shift sides and modifier subsets, repeat
+suppression, remote key releases, and ordinary F9 passthrough. Native private-
+desktop checks cover a local window above non-topmost rdk, the actual dialog
+resource and text/glyph fit at 96/144/192 DPI, top anchoring, equal-height controls,
+narrow wrapping, tooltips, hover, Tab/Enter/Escape, command routing, input isolation, dismissal,
+minimized entry, and recovery/shutdown cleanup. Live taskbar interaction and
+switching between real local applications and an RDP session still need a user
+check; no real keyboard events are injected by these tests. Run the window test
+with `--preview-menu` from the build directory to write native bitmap previews.
+Native icon checks require transparent borders and screen interior plus visible
+artwork in every tested size.
 Ctrl+Alt+Delete regressions record the exact remote scan sequence, modifier
 preservation, End repeat/release suppression, numpad passthrough, and send-failure
 cleanup. Capture tests check foreground gating and stale focus messages. Native

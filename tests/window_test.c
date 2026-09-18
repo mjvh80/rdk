@@ -255,6 +255,281 @@ static int check_security_menu(void)
 	return 0;
 }
 
+static UINT menuScanCount;
+static UINT menuF9Count;
+static UINT menuDeleteCount;
+static BOOL menuPreview;
+
+static int save_menu_preview(HWND window, UINT dpi, BOOL narrow)
+{
+	RECT bounds;
+	CHECK(GetWindowRect(window, &bounds));
+	const int width = bounds.right - bounds.left;
+	const int height = bounds.bottom - bounds.top;
+	HDC screen = GetDC(window);
+	HDC drawing = CreateCompatibleDC(screen);
+	BITMAPINFO format = { 0 };
+	format.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	format.bmiHeader.biWidth = width;
+	format.bmiHeader.biHeight = -height;
+	format.bmiHeader.biPlanes = 1;
+	format.bmiHeader.biBitCount = 32;
+	void* pixels = NULL;
+	HBITMAP bitmap = CreateDIBSection(drawing, &format, DIB_RGB_COLORS, &pixels, NULL, 0);
+	CHECK(bitmap);
+	HGDIOBJ previous = SelectObject(drawing, bitmap);
+	SendMessageW(window, WM_PRINT, (WPARAM)drawing, PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
+	GdiFlush();
+	size_t marks = 0;
+	for (size_t index = 0; index < (size_t)width * height; ++index)
+	{
+		const BYTE* pixel = (const BYTE*)pixels + index * 4;
+		if (pixel[0] < 180 || pixel[1] < 180 || pixel[2] < 180)
+			++marks;
+	}
+	CHECK(marks > (size_t)width * height / 100);
+	CHECK(marks < (size_t)width * height * 3 / 4);
+	BITMAPFILEHEADER header = { 0 };
+	header.bfType = 0x4D42;
+	header.bfOffBits = sizeof(header) + sizeof(BITMAPINFOHEADER);
+	header.bfSize = header.bfOffBits + width * height * 4;
+	char name[80];
+	sprintf_s(name, sizeof(name), "rdk-session-menu-%u%s.bmp", dpi, narrow ? "-narrow" : "");
+	FILE* file = NULL;
+	CHECK(fopen_s(&file, name, "wb") == 0);
+	CHECK(fwrite(&header, sizeof(header), 1, file) == 1);
+	CHECK(fwrite(&format.bmiHeader, sizeof(BITMAPINFOHEADER), 1, file) == 1);
+	CHECK(fwrite(pixels, header.bfSize - header.bfOffBits, 1, file) == 1);
+	fclose(file);
+	SelectObject(drawing, previous);
+	DeleteObject(bitmap);
+	DeleteDC(drawing);
+	ReleaseDC(window, screen);
+	return 0;
+}
+
+static int check_menu_scaling(HWND menu)
+{
+	const UINT scales[] = { 96, 144, 192 };
+	for (size_t scale = 0; scale < ARRAYSIZE(scales); ++scale)
+	{
+		const UINT dpi = scales[scale];
+		for (UINT narrow = 0; narrow < 2; ++narrow)
+		{
+			RECT area = { 20, 30, 20 + MulDiv(narrow ? 340 : 800, dpi, 96), 30 + MulDiv(600, dpi, 96) };
+			rdk_layout_session_menu(menu, &area, dpi);
+			RECT outer;
+			CHECK(GetWindowRect(menu, &outer));
+			CHECK(outer.top == area.top + MulDiv(10, dpi, 96));
+			CHECK(outer.left >= area.left && outer.right <= area.right && outer.bottom <= area.bottom);
+			CHECK(abs((outer.left - area.left) - (area.right - outer.right)) <= 1);
+			RECT client;
+			CHECK(GetClientRect(menu, &client));
+			RECT previous = { 0 };
+			for (size_t index = 0; index < ARRAYSIZE(rdk_menu_commands); ++index)
+			{
+				HWND button = GetDlgItem(menu, rdk_menu_commands[index]);
+				CHECK((GetWindowLongW(button, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW);
+				RECT bounds;
+				CHECK(GetWindowRect(button, &bounds));
+				MapWindowPoints(NULL, menu, (POINT*)&bounds, 2);
+				CHECK(bounds.left >= 0 && bounds.right <= client.right && bounds.top >= 0 && bounds.bottom <= client.bottom);
+				CHECK(bounds.bottom - bounds.top == MulDiv(34, dpi, 96));
+				if (index)
+				{
+					RECT overlap;
+					CHECK(!IntersectRect(&overlap, &previous, &bounds));
+					if (!narrow) CHECK(bounds.top == previous.top && bounds.bottom == previous.bottom);
+				}
+				rdkSessionMenu* state = (rdkSessionMenu*)GetWindowLongPtrW(menu, DWLP_USER);
+				const BOOL symbol = rdk_menu_commands[index] == IDCANCEL || rdk_menu_commands[index] == IDC_SESSION_MINIMIZE;
+				HDC drawing = GetDC(button);
+				CHECK(drawing);
+				HGDIOBJ original = SelectObject(drawing, symbol ? state->symbols : state->font);
+				WCHAR label[80];
+				CHECK(GetWindowTextW(button, label, ARRAYSIZE(label)));
+				const WCHAR* text = symbol ? (rdk_menu_commands[index] == IDCANCEL ? L"\xE8BB" : L"\xE921") : label;
+				WORD glyphs[80];
+				CHECK(GetGlyphIndicesW(drawing, text, (int)wcslen(text), glyphs, GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR);
+				for (size_t character = 0; character < wcslen(text); ++character)
+					CHECK(glyphs[character] != 0xFFFF);
+				RECT textBounds = { 0 };
+				CHECK(DrawTextW(drawing, text, -1, &textBounds, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX));
+				CHECK(textBounds.right + MulDiv(12, dpi, 96) <= bounds.right - bounds.left);
+				CHECK(textBounds.bottom + MulDiv(4, dpi, 96) <= bounds.bottom - bounds.top);
+				SelectObject(drawing, original);
+				ReleaseDC(button, drawing);
+				previous = bounds;
+			}
+			if (menuPreview) CHECK(save_menu_preview(menu, dpi, narrow != 0) == 0);
+		}
+	}
+	return 0;
+}
+
+static BOOL record_menu_scan(rdpInput* input, UINT16 flags, UINT8 code)
+{
+	(void)input;
+	++menuScanCount;
+	if (code == RDP_SCANCODE_F9)
+		++menuF9Count;
+	if (code == (RDP_SCANCODE_DELETE & 0xFF) && (flags & KBD_FLAGS_EXTENDED))
+		++menuDeleteCount;
+	return TRUE;
+}
+
+static int check_session_menu(void)
+{
+	rdkContext client = { 0 };
+	client.winW = 800;
+	client.winH = 600;
+	rdk_keyboard_init(&client.keyboard, NULL);
+	client.keyboard.sendScan = record_menu_scan;
+	client.hwnd = rdk_create_window(&client);
+	CHECK(client.hwnd);
+	rdk_capture_init(&client.capture, client.hwnd);
+	CHECK(!(GetWindowLongW(client.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST));
+	CHECK((GetWindowLongW(client.hwnd, GWL_STYLE) & WS_CAPTION) == 0);
+	ShowWindow(client.hwnd, SW_SHOWNOACTIVATE);
+	HWND local = CreateWindowExW(0, L"STATIC", L"Local application", WS_OVERLAPPEDWINDOW,
+	    50, 50, 300, 250, NULL, NULL, GetModuleHandleW(NULL), NULL);
+	CHECK(local);
+	ShowWindow(local, SW_SHOWNOACTIVATE);
+	CHECK(SetWindowPos(local, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE));
+	BOOL localAbove = FALSE;
+	for (HWND window = GetWindow(client.hwnd, GW_HWNDPREV); window; window = GetWindow(window, GW_HWNDPREV))
+		localAbove = localAbove || window == local;
+	CHECK(localAbove && !IsIconic(client.hwnd));
+	DestroyWindow(local);
+	CHECK(GetMenuState(GetSystemMenu(client.hwnd, FALSE), RDK_SC_SESSION_MENU, MF_BYCOMMAND) != (UINT)-1);
+	SendMessageW(client.hwnd, WM_SETFOCUS, 0, 0);
+	CHECK(client.focused && (client.capture.state & 1));
+	rdk_on_key(&client, WM_KEYDOWN, VK_CONTROL, ((LPARAM)RDP_SCANCODE_LCONTROL << 16) | 1);
+	rdk_on_key(&client, WM_KEYDOWN, VK_SHIFT, ((LPARAM)RDP_SCANCODE_LSHIFT << 16) | 1);
+	rdk_on_key(&client, WM_KEYDOWN, VK_F9, ((LPARAM)RDP_SCANCODE_F9 << 16) | 3);
+	HWND menu = client.sessionMenu;
+	CHECK(menu && IsWindow(menu));
+	CHECK(!client.focused && !(client.capture.state & 1));
+	CHECK(!client.keyboard.menu && !client.quit && !client.reconnectRequested);
+	CHECK(menuScanCount == 4 && menuF9Count == 0);
+	CHECK(rdk_keyboard_idle(&client.keyboard));
+	CHECK(GetWindow(menu, GW_OWNER) == client.hwnd);
+	CHECK(!(GetWindowLongW(menu, GWL_EXSTYLE) & (WS_EX_TOPMOST | WS_EX_APPWINDOW)));
+	CHECK((GetWindowLongW(menu, GWL_STYLE) & WS_CAPTION) != WS_CAPTION);
+	CHECK(LOWORD(SendMessageW(menu, DM_GETDEFID, 0, 0)) == IDCANCEL);
+	rdkSessionMenu* menuState = (rdkSessionMenu*)GetWindowLongPtrW(menu, DWLP_USER);
+	CHECK(menuState && menuState->tooltip);
+	CHECK(SendMessageW(menuState->tooltip, TTM_GETTOOLCOUNT, 0, 0) == ARRAYSIZE(rdk_menu_commands));
+	HWND closeButton = GetDlgItem(menu, IDCANCEL);
+	SendMessageW(closeButton, WM_MOUSEMOVE, 0, MAKELPARAM(5, 5));
+	CHECK(menuState->hovered == IDCANCEL);
+	SendMessageW(closeButton, WM_MOUSELEAVE, 0, 0);
+	CHECK(menuState->hovered == 0);
+	const int commands[] = { IDC_SESSION_MINIMIZE, IDC_SESSION_SECURITY, IDC_SESSION_RECONNECT,
+	                         IDC_SESSION_DISCONNECT, IDCANCEL };
+	RECT previous = { 0 };
+	RECT clientBounds;
+	CHECK(GetClientRect(menu, &clientBounds));
+	for (size_t index = 0; index < ARRAYSIZE(commands); ++index)
+	{
+		HWND button = GetDlgItem(menu, commands[index]);
+		CHECK(button && IsWindowEnabled(button));
+		RECT bounds;
+		CHECK(GetWindowRect(button, &bounds));
+		MapWindowPoints(NULL, menu, (POINT*)&bounds, 2);
+		CHECK(bounds.left >= 0 && bounds.right <= clientBounds.right);
+		CHECK(bounds.top >= 0 && bounds.bottom <= clientBounds.bottom);
+		if (index)
+			CHECK(bounds.top == previous.top && bounds.bottom == previous.bottom && bounds.left > previous.right);
+		WCHAR label[128];
+		CHECK(GetWindowTextW(button, label, ARRAYSIZE(label)));
+		HDC drawing = GetDC(button);
+		CHECK(drawing);
+		HGDIOBJ original = SelectObject(drawing, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0));
+		RECT text = { 0 };
+		CHECK(DrawTextW(drawing, label, -1, &text, DT_CALCRECT | DT_SINGLELINE));
+		if (commands[index] != IDCANCEL && commands[index] != IDC_SESSION_MINIMIZE)
+			CHECK(text.right + 12 <= bounds.right - bounds.left);
+		CHECK(text.bottom + 4 <= bounds.bottom - bounds.top);
+		SelectObject(drawing, original);
+		ReleaseDC(button, drawing);
+		previous = bounds;
+	}
+	rdk_show_session_menu(&client);
+	CHECK(client.sessionMenu == menu);
+	SendMessageW(client.hwnd, WM_SETFOCUS, 0, 0);
+	CHECK(!client.focused && !(client.capture.state & 1));
+	rdk_on_key(&client, WM_KEYDOWN, 'A', ((LPARAM)RDP_SCANCODE_KEY_A << 16) | 1);
+	SendMessageW(client.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(10, 10));
+	CHECK(menuScanCount == 4 && !client.mouseButtons);
+	CHECK(check_menu_scaling(menu) == 0);
+	MSG escape = { 0 };
+	escape.hwnd = GetDlgItem(menu, IDCANCEL);
+	escape.message = WM_KEYDOWN;
+	escape.wParam = VK_ESCAPE;
+	CHECK(IsDialogMessageW(menu, &escape));
+	CHECK(!client.sessionMenu && !IsWindow(menu) && !client.quit);
+	SendMessageW(client.hwnd, WM_SETFOCUS, 0, 0);
+	CHECK(client.focused && (client.capture.state & 1));
+	rdk_on_key(&client, WM_KEYDOWN, 'A', ((LPARAM)RDP_SCANCODE_KEY_A << 16) | 1);
+	rdk_on_key(&client, WM_KEYUP, 'A', ((LPARAM)RDP_SCANCODE_KEY_A << 16) | 1);
+	CHECK(menuScanCount == 6);
+	SendMessageW(client.hwnd, WM_SYSCOMMAND, RDK_SC_SESSION_MENU, 0);
+	CHECK(client.sessionMenu);
+	MSG navigation = { 0 };
+	navigation.hwnd = GetDlgItem(client.sessionMenu, IDCANCEL);
+	navigation.message = WM_KEYDOWN;
+	navigation.wParam = VK_TAB;
+	CHECK(IsDialogMessageW(client.sessionMenu, &navigation));
+	CHECK(GetFocus() == GetDlgItem(client.sessionMenu, IDC_SESSION_MINIMIZE));
+	for (size_t index = 0; index < ARRAYSIZE(rdk_menu_commands); ++index)
+		CHECK((GetWindowLongW(GetDlgItem(client.sessionMenu, rdk_menu_commands[index]), GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW);
+	SetFocus(GetDlgItem(client.sessionMenu, IDCANCEL));
+	navigation.hwnd = GetDlgItem(client.sessionMenu, IDCANCEL);
+	navigation.wParam = VK_RETURN;
+	CHECK(IsDialogMessageW(client.sessionMenu, &navigation));
+	CHECK(!client.sessionMenu && !client.quit);
+	SendMessageW(client.hwnd, WM_SYSCOMMAND, RDK_SC_SESSION_MENU, 0);
+	CHECK(client.sessionMenu);
+	SendMessageW(client.sessionMenu, WM_COMMAND, IDC_SESSION_SECURITY, 0);
+	CHECK(!client.sessionMenu && menuDeleteCount == 2 && !client.quit);
+	SendMessageW(client.hwnd, WM_SYSCOMMAND, RDK_SC_SESSION_MENU, 0);
+	CHECK(client.sessionMenu);
+	SendMessageW(client.sessionMenu, WM_COMMAND, IDC_SESSION_MINIMIZE, 0);
+	CHECK(!client.sessionMenu && IsIconic(client.hwnd) && !client.quit);
+	SendMessageW(client.hwnd, WM_SYSCOMMAND, RDK_SC_SESSION_MENU, 0);
+	CHECK(client.sessionMenu && !IsIconic(client.hwnd));
+	SendMessageW(client.sessionMenu, WM_ACTIVATE, WA_INACTIVE, 0);
+	CHECK(!client.sessionMenu && !client.quit);
+	rdk_show_session_menu(&client);
+	CHECK(client.sessionMenu);
+	CHECK(rdk_gdi_recovery(&client, TRUE));
+	CHECK(!client.sessionMenu);
+	rdk_show_session_menu(&client);
+	CHECK(!client.sessionMenu);
+	CHECK(rdk_gdi_recovery(&client, FALSE));
+	rdk_show_session_menu(&client);
+	CHECK(client.sessionMenu);
+	SendMessageW(client.sessionMenu, WM_COMMAND, IDC_SESSION_RECONNECT, 0);
+	CHECK(!client.sessionMenu && client.quit && client.reconnectRequested);
+	CHECK(strcmp(client.stopReason, "session menu reconnect requested") == 0);
+	client.quit = client.reconnectRequested = FALSE;
+	rdk_show_session_menu(&client);
+	CHECK(client.sessionMenu);
+	SendMessageW(client.sessionMenu, WM_COMMAND, IDC_SESSION_DISCONNECT, 0);
+	CHECK(!client.sessionMenu && client.quit && !client.reconnectRequested);
+	CHECK(strcmp(client.stopReason, "session menu disconnect requested") == 0);
+	rdk_show_session_menu(&client);
+	CHECK(!client.sessionMenu);
+	client.quit = FALSE;
+	rdk_show_session_menu(&client);
+	CHECK(client.sessionMenu);
+	SendMessageW(client.hwnd, WM_CLOSE, 0, 0);
+	CHECK(!client.sessionMenu && client.quit);
+	DestroyWindow(client.hwnd);
+	return 0;
+}
+
 static int run_taskbar_helper(const WCHAR* action, const WCHAR* executable, DWORD expectedExit)
 {
 	WCHAR helper[32768];
@@ -285,8 +560,9 @@ static int run_taskbar_helper(const WCHAR* action, const WCHAR* executable, DWOR
 	return 0;
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+	menuPreview = argc == 2 && strcmp(argv[1], "--preview-menu") == 0;
 	CHECK(check_graphics_logging() == 0);
 	SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 	HWINSTA originalStation = GetProcessWindowStation();
@@ -296,6 +572,7 @@ int main(void)
 	HDESK desktop = CreateDesktopW(L"rdkWindowTest", NULL, NULL, 0, GENERIC_ALL, NULL);
 	CHECK(desktop && SetThreadDesktop(desktop));
 	CHECK(check_security_menu() == 0);
+	CHECK(check_session_menu() == 0);
 	rdkContext rdk = { 0 };
 	rdk.winX = 20;
 	rdk.winY = 30;
@@ -395,6 +672,6 @@ int main(void)
 	CHECK(SetProcessWindowStation(originalStation));
 	CloseDesktop(desktop);
 	CloseWindowStation(station);
-	puts("Passed per-window Ctrl+Alt+Delete, lock indicators, native minimize/restore, input release, owned notices, and windowless helper minimize/reconnect dispatch tests");
+	puts("Passed session menu, normal window stacking, per-window Ctrl+Alt+Delete, lock indicators, native minimize/restore, input release, owned notices, and windowless helper dispatch tests");
 	return 0;
 }

@@ -309,6 +309,16 @@ static BOOL rdk_key_event(rdkKeyboard* keyboard, UINT16 code, BOOL down)
 		keyboard->suppressed[code] = TRUE;
 		return rdk_keyboard_ctrl_alt_delete(keyboard);
 	}
+	if (down && !wasDown && code == RDP_SCANCODE_F9 &&
+	    (keyboard->localDown[RDP_SCANCODE_LCONTROL] || keyboard->localDown[RDP_SCANCODE_RCONTROL]) &&
+	    (keyboard->localDown[RDP_SCANCODE_LSHIFT] || keyboard->localDown[RDP_SCANCODE_RSHIFT]))
+	{
+		keyboard->menu = TRUE;
+		const BOOL ok = rdk_keyboard_release_all(keyboard);
+		keyboard->localDown[code] = TRUE;
+		keyboard->suppressed[code] = TRUE;
+		return ok;
+	}
 	if (down && (code == RDP_SCANCODE_F12 || code == RDP_SCANCODE_F11 || code == RDP_SCANCODE_F10) &&
 	    (keyboard->localDown[RDP_SCANCODE_LCONTROL] || keyboard->localDown[RDP_SCANCODE_RCONTROL]) &&
 	    (keyboard->localDown[RDP_SCANCODE_LSHIFT] || keyboard->localDown[RDP_SCANCODE_RSHIFT]))
@@ -378,7 +388,7 @@ BOOL rdk_keyboard_key(rdkKeyboard* keyboard, UINT message, WPARAM vk, LPARAM dat
 	{
 		if (!rdk_key_event(keyboard, code, down))
 			return FALSE;
-		if (keyboard->quit || keyboard->minimize)
+		if (keyboard->quit || keyboard->minimize || keyboard->menu)
 			break;
 	}
 	return TRUE;
